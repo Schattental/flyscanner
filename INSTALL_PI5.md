@@ -2,7 +2,7 @@
 
 V2 is built for a **64-bit Raspberry Pi OS Lite** installation and the USB
 webcam used by the original scanner. It records at 1280x720 and 30 FPS by
-default, while analyzing a 746x720 region at 15 FPS. The calibrated region uses
+default, while analyzing the 746x720 region at the full 30 FPS. The calibrated region uses
 normalized frame coordinates: 17.34375% through 75.625% horizontally and the
 full frame height. At 1280x720 this is x=222 through x=967; at 1920x1080 it is
 x=333 through x=1451. This preserves the exact relative part of the image when
@@ -125,7 +125,16 @@ balance, and focus at their settled values. Webcam support varies, so the JSON,
 per-scan CSV, and master history record both the successfully locked controls
 and their read-back values. Unsupported controls do not fail the scan. Use
 `--no-camera-lock` only when troubleshooting a camera that rejects manual
-controls.
+controls. V2 also disables supported webcams' exposure-driven dynamic frame
+rate before warm-up so a requested 30 FPS mode does not silently fall to 15
+FPS. Use `--allow-dynamic-framerate` only if maintaining brightness in very low
+light is more important than frame cadence.
+
+V2 queues four V4L2 camera buffers by default. This is important for the tested
+USB webcam: a one-buffer queue negotiated 30 FPS but delivered only 15 FPS,
+whereas four buffers delivered the full 30 FPS by keeping USB transfers queued
+while OpenCV decoded the previous MJPEG frame. Change this only when diagnosing
+another camera with `--camera-buffers NUMBER`.
 
 If capture does not sustain 30 FPS, first confirm that the camera advertises an
 MJPG mode at the requested resolution. Full-resolution cropped analysis costs
@@ -138,6 +147,11 @@ more CPU; you can reduce analysis load without reducing the recorded frame rate:
 For a camera that advertises it, 1080p/30 can be requested with `--width 1920
 --height 1080 --fps 30`. The script prints the mode actually negotiated by the
 camera, which may differ from the request.
+
+The activity score is an unbounded index rather than a percentage. High-motion
+scans can therefore exceed 100; the score is deliberately not capped so two
+very active samples remain distinguishable. The JSON and CSV also retain the
+underlying motion and moving-fly-area percentages for inspection.
 
 ## 4. Install and start the system services
 

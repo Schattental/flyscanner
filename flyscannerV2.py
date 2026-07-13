@@ -27,6 +27,7 @@ import re
 import shutil
 import signal
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -103,6 +104,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=1280, help="Requested frame width.")
     parser.add_argument("--height", type=int, default=720, help="Requested frame height.")
     parser.add_argument(
+        "--camera-buffers",
+        type=int,
+        default=4,
+        help="Number of queued V4L2 camera buffers; four sustains USB webcam throughput.",
+    )
+    parser.add_argument(
         "--analysis-width",
         type=int,
         default=0,
@@ -123,7 +130,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--analyze-every",
         type=int,
-        default=2,
+        default=1,
         help="Analyze every Nth captured frame; raise further if capture cannot sustain its FPS.",
     )
     parser.add_argument(
@@ -142,6 +149,11 @@ def parse_args() -> argparse.Namespace:
         "--no-camera-lock",
         action="store_true",
         help="Leave supported camera exposure, white balance and focus controls automatic.",
+    )
+    parser.add_argument(
+        "--allow-dynamic-framerate",
+        action="store_true",
+        help="Allow the webcam to lower FPS for longer exposure; fixed FPS is the default.",
     )
     parser.add_argument(
         "--output-dir",
@@ -653,7 +665,13 @@ def camera_source(value: str) -> str | int:
     return int(value) if value.isdecimal() else value
 
 
-def open_camera(camera_index: str, width: int, height: int, fps: float) -> cv2.VideoCapture:
+def open_camera(
+    camera_index: str,
+    width: int,
+    height: int,
+    fps: float,
+    buffer_count: int = 4,
+) -> cv2.VideoCapture:
     source = camera_source(camera_index)
     cap = cv2.VideoCapture(source, cv2.CAP_V4L2)
     if not cap.isOpened():
@@ -669,8 +687,51 @@ def open_camera(camera_index: str, width: int, height: int, fps: float) -> cv2.V
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
     cap.set(cv2.CAP_PROP_FPS, fps)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    # A single V4L2 buffer caused this UVC camera to lose every other USB
+    # transfer (15 FPS despite a negotiated 30 FPS mode). Four keeps transfers
+    # queued while OpenCV decodes the previous MJPEG frame.
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, buffer_count)
     return cap
+
+
+def disable_camera_dynamic_framerate(camera_index: str, allowed: bool = False) -> bool:
+    """Keep supported V4L2 webcams from silently lowering the requested FPS."""
+    if allowed:
+        return False
+    if camera_index.isdecimal():
+        device = f"/dev/video{camera_index}"
+    elif camera_index.startswith("/dev/video"):
+        device = camera_index
+    else:
+        print(
+            "Warning: cannot configure dynamic frame rate for a non-V4L2 camera source",
+            file=sys.stderr,
+        )
+        return False
+    try:
+        result = subprocess.run(
+            [
+                "v4l2-ctl",
+                f"--device={device}",
+                "--set-ctrl=exposure_dynamic_framerate=0",
+            ],
+            text=True,
+            capture_output=True,
+            timeout=5.0,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"Warning: could not fix camera frame rate: {exc}", file=sys.stderr)
+        return False
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        print(
+            f"Camera has no controllable dynamic frame rate; continuing: {detail}",
+            file=sys.stderr,
+        )
+        return False
+    print("Disabled webcam exposure-driven frame-rate reduction")
+    return True
 
 
 def valid_camera_value(cap: cv2.VideoCapture, property_id: int | None) -> float | None:
@@ -844,7 +905,9 @@ class LiveActivityAnalyzer:
         fly_area_mean = float(np.mean(self.fly_area_percentages))
         moving_fly_area_mean = float(np.mean(self.moving_fly_area_percentages))
         raw_score = (0.7 * moving_fly_area_mean + 0.3 * motion_mean) / 2.0 * 100.0
-        activity_score = float(np.clip(raw_score, 0.0, 100.0))
+        # This is an activity index, not a percentage. Do not clamp it to 100:
+        # highly active samples must remain distinguishable from one another.
+        activity_score = float(raw_score)
 
         return ActivityResult(
             scan_timestamp=metadata["scan_timestamp"],
@@ -892,7 +955,16 @@ def capture_video(
     lcd.write("Opening camera", f"Cam {args.camera}")
     if dashboard is not None:
         dashboard.set_status("opening_camera", f"Camera {args.camera}")
-    cap = open_camera(args.camera, args.width, args.height, args.fps)
+    fixed_framerate = disable_camera_dynamic_framerate(
+        args.camera, args.allow_dynamic_framerate
+    )
+    cap = open_camera(
+        args.camera,
+        args.width,
+        args.height,
+        args.fps,
+        args.camera_buffers,
+    )
 
     if args.warmup > 0:
         if dashboard is not None:
@@ -909,6 +981,11 @@ def capture_video(
             time.sleep(0.05)
 
     camera_metadata = lock_camera_controls(cap, args.no_camera_lock)
+    if fixed_framerate:
+        locked_controls = camera_metadata["camera_locked_controls"]
+        camera_metadata["camera_locked_controls"] = ",".join(
+            value for value in (locked_controls, "dynamic_framerate") if value
+        )
     if camera_metadata["camera_locked_controls"]:
         # Drain a few buffers after changing controls so the first saved frame
         # reflects the locked settings.
@@ -1545,8 +1622,16 @@ def run_scan_once(
 
 def main() -> int:
     args = parse_args()
-    if args.duration <= 0 or args.fps <= 0 or args.width <= 0 or args.height <= 0:
-        raise ValueError("duration, fps, width and height must all be greater than zero")
+    if (
+        args.duration <= 0
+        or args.fps <= 0
+        or args.width <= 0
+        or args.height <= 0
+        or args.camera_buffers <= 0
+    ):
+        raise ValueError(
+            "duration, fps, width, height and camera-buffers must all be greater than zero"
+        )
     if args.analysis_width < 0 or args.analyze_every <= 0 or args.opencv_threads <= 0:
         raise ValueError("analysis-width cannot be negative; analyze-every and threads must be positive")
     if not -100.0 <= args.analysis_shift_x <= 100.0:

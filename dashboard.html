@@ -93,7 +93,9 @@
         ['Resolution',`${result.capture_width}×${result.capture_height}`],
         ['Analysis ROI',`${result.analysis_roi_width}×${result.analysis_roi_height} at x=${result.analysis_roi_left}`],
         ['Captured FPS',Number(result.fps_estimate).toFixed(2)],
-        ['Frames',result.frames_captured], ['Dropped',result.frames_dropped],
+        ['Analysis FPS',Number(result.analysis_fps_estimate).toFixed(2)],
+        ['Captured frames',result.frames_captured],
+        ['Analyzed frames',result.frames_analyzed], ['Dropped',result.frames_dropped],
         ['Locked',result.camera_locked_controls || 'Unsupported'],
       ];
       $('captureDetails').innerHTML = rows.map(([a,b]) => `<span>${esc(a)}</span><span>${esc(b)}</span>`).join('');
