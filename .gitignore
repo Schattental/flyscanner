@@ -1,0 +1,17 @@
+# Python environment and generated files
+.venv/
+__pycache__/
+*.py[cod]
+
+# Scanner output and device-specific runtime state
+captures/
+flyscanner_state.json
+
+# Local configuration and editor files
+.env
+.vscode/
+.idea/
+.codex/
+.agents/
+.DS_Store
+*~

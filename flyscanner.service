@@ -1,0 +1,20 @@
+[Unit]
+Description=Flyscanner button-driven activity scanner
+After=local-fs.target
+
+[Service]
+Type=simple
+User=flyscanner
+Group=flyscanner
+SupplementaryGroups=video gpio
+WorkingDirectory=/home/flyscanner/flyscanner
+Environment=PYTHONUNBUFFERED=1
+Environment=GPIOZERO_PIN_FACTORY=lgpio
+EnvironmentFile=-/etc/default/flyscanner
+ExecStart=/home/flyscanner/flyscanner/.venv/bin/python /home/flyscanner/flyscanner/flyscannerV2.py $FLYSCANNER_ARGS
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

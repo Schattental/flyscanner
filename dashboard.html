@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Flyscanner</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0b1110; --panel:#14201d; --line:#294039; --green:#65e6a6; --muted:#91a9a1; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:radial-gradient(circle at top,#173129,var(--bg) 45%); color:#edf8f4; font:15px system-ui,sans-serif; }
+    main { width:min(1100px,calc(100% - 28px)); margin:28px auto 60px; }
+    header { display:flex; align-items:center; justify-content:space-between; gap:16px; margin-bottom:18px; }
+    h1 { margin:0; font-size:clamp(26px,5vw,42px); letter-spacing:-.04em; }
+    h2 { margin:0 0 14px; font-size:17px; }
+    .live { display:flex; align-items:center; gap:8px; color:var(--muted); }
+    .dot { width:10px; height:10px; border-radius:50%; background:#e8ae4a; box-shadow:0 0 12px currentColor; }
+    .dot.online { background:var(--green); }
+    .grid { display:grid; grid-template-columns:repeat(12,1fr); gap:14px; }
+    .card { background:color-mix(in srgb,var(--panel) 92%,transparent); border:1px solid var(--line); border-radius:16px; padding:18px; box-shadow:0 18px 50px #0004; }
+    .score { grid-column:span 4; min-height:190px; display:flex; flex-direction:column; justify-content:space-between; }
+    .status { grid-column:span 4; }
+    .health { grid-column:span 4; }
+    .image { grid-column:span 7; }
+    .details { grid-column:span 5; }
+    .history { grid-column:1/-1; overflow:auto; }
+    .big { color:var(--green); font-size:64px; font-weight:750; letter-spacing:-.06em; line-height:1; }
+    .label,.muted { color:var(--muted); }
+    .kv { display:grid; grid-template-columns:1fr auto; gap:10px 14px; }
+    .kv span:nth-child(even) { text-align:right; font-variant-numeric:tabular-nums; }
+    img { display:block; width:100%; max-height:520px; object-fit:contain; border-radius:10px; background:#070b0a; }
+    table { width:100%; border-collapse:collapse; white-space:nowrap; }
+    th,td { padding:10px 12px; border-bottom:1px solid var(--line); text-align:left; }
+    th { color:var(--muted); font-weight:600; }
+    a { color:var(--green); }
+    .empty { min-height:180px; display:grid; place-items:center; color:var(--muted); }
+    @media (max-width:760px) { .score,.status,.health,.image,.details { grid-column:1/-1; } main { margin-top:18px; } }
+  </style>
+</head>
+<body>
+<main>
+  <header><div><div class="muted">Raspberry Pi 5</div><h1>Flyscanner</h1></div><div class="live"><span id="dot" class="dot"></span><span id="connection">Connecting</span></div></header>
+  <section class="grid">
+    <article class="card score"><div><div class="label">Latest activity</div><div id="score" class="big">—</div></div><div id="scanTime" class="muted">No completed scans</div></article>
+    <article class="card status"><h2>Scanner</h2><div class="kv"><span>Status</span><span id="status">Starting</span><span>Detail</span><span id="detail">—</span><span>IR during capture</span><span id="ir">—</span></div></article>
+    <article class="card health"><h2>Device health</h2><div class="kv"><span>Temperature</span><span id="temp">—</span><span>Disk free</span><span id="disk">—</span><span>Disk used</span><span id="diskUsed">—</span></div></article>
+    <article class="card image"><h2>Analysis alignment</h2><div id="imageEmpty" class="empty">The first completed scan will appear here.</div><img id="image" hidden alt="Latest analysis alignment frame"></article>
+    <article class="card details"><h2>Latest capture</h2><div id="captureDetails" class="kv"><span class="muted">No capture metadata yet.</span></div><p><a id="video" hidden>Download latest video</a></p><p><a href="/scan_history.csv">Download complete CSV history</a></p></article>
+    <article class="card history"><h2>Recent scans</h2><table><thead><tr><th>Time</th><th>Score</th><th>IR</th><th>FPS</th><th>Brightness</th><th>Locked controls</th></tr></thead><tbody id="history"><tr><td colspan="6" class="muted">No scans recorded.</td></tr></tbody></table></article>
+  </section>
+</main>
+<script>
+  const $ = id => document.getElementById(id);
+  const text = value => value === null || value === undefined || value === '' ? '—' : String(value);
+  const esc = value => text(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  let lastImageKey = '';
+  function render(data) {
+    const result = data.latest_result;
+    $('status').textContent = text(data.status).replaceAll('_',' ');
+    $('detail').textContent = text(data.detail);
+    $('ir').textContent = data.ir_enabled ? 'ON' : 'OFF';
+    $('temp').textContent = data.health.temperature_c == null ? '—' : `${data.health.temperature_c} °C`;
+    $('disk').textContent = data.health.disk_free_gb == null ? '—' : `${data.health.disk_free_gb} GB`;
+    $('diskUsed').textContent = data.health.disk_used_percent == null ? '—' : `${data.health.disk_used_percent}%`;
+    if (result) {
+      $('score').textContent = Number(result.activity_score).toFixed(2);
+      $('scanTime').textContent = text(result.scan_timestamp);
+      const key = String(result.scan_timestamp);
+      if (data.latest_image_available) {
+        if (key !== lastImageKey) { $('image').src = `/latest-image?t=${encodeURIComponent(key)}`; lastImageKey = key; }
+        $('image').hidden = false; $('imageEmpty').hidden = true;
+      } else {
+        $('image').hidden = true; $('imageEmpty').hidden = false;
+        $('imageEmpty').textContent = 'The latest alignment image is no longer stored.';
+      }
+      const rows = [
+        ['Resolution',`${result.capture_width}×${result.capture_height}`],
+        ['Analysis ROI',`${result.analysis_roi_width}×${result.analysis_roi_height} at x=${result.analysis_roi_left}`],
+        ['Captured FPS',Number(result.fps_estimate).toFixed(2)],
+        ['Frames',result.frames_captured], ['Dropped',result.frames_dropped],
+        ['Locked',result.camera_locked_controls || 'Unsupported'],
+      ];
+      $('captureDetails').innerHTML = rows.map(([a,b]) => `<span>${esc(a)}</span><span>${esc(b)}</span>`).join('');
+      const filename = String(result.video_path).split('/').pop();
+      $('video').href = `/captures/${encodeURIComponent(filename)}`; $('video').hidden = false;
+    }
+    const rows = [...data.history].reverse().slice(0,20);
+    $('history').innerHTML = rows.length ? rows.map(r => `<tr><td>${esc(r.scan_timestamp)}</td><td>${esc(r.activity_score)}</td><td>${String(r.ir_enabled).toLowerCase()==='true'?'ON':'OFF'}</td><td>${esc(r.fps_estimate)}</td><td>${esc(r.brightness_mean)}</td><td>${esc(r.camera_locked_controls || '—')}</td></tr>`).join('') : '<tr><td colspan="6" class="muted">No scans recorded.</td></tr>';
+  }
+  function connect() {
+    const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
+    ws.onopen = () => { $('dot').classList.add('online'); $('connection').textContent='Live'; };
+    ws.onmessage = event => render(JSON.parse(event.data));
+    ws.onclose = () => { $('dot').classList.remove('online'); $('connection').textContent='Reconnecting'; setTimeout(connect,1500); };
+    ws.onerror = () => ws.close();
+  }
+  connect();
+</script>
+</body>
+</html>
