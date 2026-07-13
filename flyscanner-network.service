@@ -1,0 +1,19 @@
+[Unit]
+Description=Flyscanner fallback hotspot and Wi-Fi onboarding
+Wants=NetworkManager.service
+After=NetworkManager.service
+Before=flyscanner.service
+
+[Service]
+Type=simple
+User=root
+Group=flyscanner
+RuntimeDirectory=flyscanner-network
+RuntimeDirectoryMode=0750
+EnvironmentFile=-/etc/default/flyscanner-network
+ExecStart=/usr/bin/python3 /usr/local/lib/flyscanner/flyscanner-network.py daemon
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

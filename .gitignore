@@ -6,6 +6,7 @@ __pycache__/
 # Scanner output and device-specific runtime state
 captures/
 flyscanner_state.json
+qr-codes/
 
 # Local configuration and editor files
 .env

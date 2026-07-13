@@ -27,7 +27,7 @@ camera interface on current Raspberry Pi OS.
 sudo apt update
 sudo apt full-upgrade -y
 sudo apt install -y python3-venv python3-dev python3-opencv python3-numpy \
-  python3-gpiozero python3-lgpio v4l-utils
+  python3-gpiozero python3-lgpio v4l-utils network-manager
 sudo usermod -aG video,gpio flyscanner
 ```
 
@@ -139,19 +139,31 @@ For a camera that advertises it, 1080p/30 can be requested with `--width 1920
 --height 1080 --fps 30`. The script prints the mode actually negotiated by the
 camera, which may differ from the request.
 
-## 4. Install and start the system service
+## 4. Install and start the system services
 
 ```bash
+sudo install -d -m 0755 /usr/local/lib/flyscanner
+sudo install -m 0755 flyscanner-network.py \
+  /usr/local/lib/flyscanner/flyscanner-network.py
+sudo install -m 0644 flyscanner-network.service \
+  /etc/systemd/system/flyscanner-network.service
+sudo install -m 0644 flyscanner-network.default \
+  /etc/default/flyscanner-network
 sudo install -m 0644 flyscanner.service /etc/systemd/system/flyscanner.service
 sudo install -m 0644 flyscanner.default /etc/default/flyscanner
 sudo systemctl daemon-reload
-sudo systemctl enable --now flyscanner.service
+sudo systemctl enable --now flyscanner-network.service flyscanner.service
+sudo systemctl restart flyscanner-network.service flyscanner.service
+systemctl status flyscanner-network.service
 systemctl status flyscanner.service
 ```
 
 The service starts at every boot and waits for the GPIO button. It runs without
 a graphical preview and restarts if startup fails. A failed individual scan is
 shown on the LCD/log and the process remains ready for another button press.
+The separate network service performs privileged NetworkManager operations. The
+scanner reaches it through a local socket accessible only to root and the
+`flyscanner` group, so the camera service itself does not run as root.
 
 ## 5. Open the local dashboard
 
@@ -187,8 +199,68 @@ its first line and the numeric IP on its second line. Adjust the recognition
 window with `--double-press-window SECONDS` and the screen duration with
 `--network-display-time SECONDS`.
 
-The dashboard intentionally has no
-remote hardware controls or authentication. Keep it on a trusted local network;
+### Fallback hotspot and first-time Wi-Fi setup
+
+At boot, the network service gives NetworkManager 45 seconds to connect to a
+saved Wi-Fi or Ethernet network. If none succeeds, it starts a
+password-protected 2.4 GHz hotspot with a unique name similar to
+`Flyscanner-A3F2`. Its simple per-device password uses the matching suffix, for
+example `flyscan-A3F2`. Connect a phone or laptop to that hotspot and open:
+
+```text
+http://10.42.0.1:8080
+```
+
+The dashboard's **Network** card scans for nearby networks. Select or enter the
+deployment network, enter its password, and choose **Save and connect**. The
+browser and any SSH session over the hotspot disconnect about two seconds later
+while the Pi changes radio mode. Once connected, use
+`http://flyscanner.local:8080` or double-press the physical button to display
+the new numeric address. The saved network reconnects after later reboots. If
+the submitted connection fails, the setup hotspot is restored automatically.
+The simple setup form supports open networks and WPA/WPA2 Personal networks;
+enterprise Wi-Fi requiring usernames, certificates, or a captive portal still
+needs site-specific NetworkManager configuration.
+
+Show the unique hotspot credentials before printing labels or deploying the
+device:
+
+```bash
+sudo /usr/local/lib/flyscanner/flyscanner-network.py credentials
+```
+
+The scanner automatically creates three print-ready PNG files when it starts:
+
+```text
+qr-codes/1-connect-flyscanner-hotspot.png
+qr-codes/2-open-hotspot-dashboard.png
+qr-codes/3-open-network-dashboard.png
+```
+
+All three appear under **Printable QR codes** in the dashboard, where they can
+be previewed and downloaded directly for printing. The folder is excluded from
+Git because the first QR image contains the hotspot password. Existing images
+are reused; they are regenerated when the hostname, dashboard port, hotspot
+name, or hotspot password changes. After changing network settings, restart
+both `flyscanner-network.service` and `flyscanner.service` to refresh them.
+
+The generated password is short and QR-safe because this hotspot is intended
+only for temporary local setup. To choose your own values or alter the fallback
+delay, edit `/etc/default/flyscanner-network` and restart both services. Use
+unique hotspot credentials for every deployed device.
+
+The built-in Wi-Fi radio switches between hotspot and client modes; it does not
+keep the setup hotspot active after joining deployment Wi-Fi. A second USB
+Wi-Fi adapter is needed for a permanent simultaneous hotspot.
+
+For maintenance over either network, enable SSH before deployment with `sudo
+raspi-config`, then choose **Interface Options** and **SSH**. Prefer SSH
+public-key authentication and disable password authentication after confirming
+that key login works.
+
+The dashboard intentionally has no capture or GPIO controls and no
+authentication. Wi-Fi changes are accepted only while the protected setup
+hotspot is active. Keep normal dashboard access on a trusted local network and
 do not forward port 8080 from your router to the internet. Change the port with
 `--web-port PORT`, bind only to one interface with `--web-host ADDRESS`, or turn
 it off with `--no-web` in `/etc/default/flyscanner`.
@@ -197,8 +269,10 @@ Useful administration commands:
 
 ```bash
 journalctl -u flyscanner.service -f
+sudo journalctl -u flyscanner-network.service -f
+sudo systemctl restart flyscanner-network.service
 sudo systemctl restart flyscanner.service
-sudo systemctl disable --now flyscanner.service
+sudo systemctl disable --now flyscanner.service flyscanner-network.service
 ```
 
 To change camera, resolution, frame rate, pins, or disable the LCD, edit

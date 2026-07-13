@@ -1,0 +1,5 @@
+# Optional fallback-hotspot settings. Unset values use unique per-device defaults.
+# FLYSCANNER_WIFI_INTERFACE=wlan0
+# FLYSCANNER_HOTSPOT_SSID=Flyscanner-A3F2
+# FLYSCANNER_HOTSPOT_PASSWORD=replace-with-a-unique-password
+FLYSCANNER_HOTSPOT_WAIT_SECONDS=45

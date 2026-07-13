@@ -1,6 +1,7 @@
 [Unit]
 Description=Flyscanner button-driven activity scanner
-After=local-fs.target
+Wants=flyscanner-network.service
+After=local-fs.target flyscanner-network.service
 
 [Service]
 Type=simple

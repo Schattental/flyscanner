@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import hashlib
 import json
 import re
 import shutil
@@ -46,6 +47,12 @@ CALIBRATED_ROI_LEFT_PERCENT = 100.0 * 222.0 / 1280.0
 CALIBRATED_ROI_RIGHT_PERCENT = 100.0 * 968.0 / 1280.0
 CALIBRATED_SHIFT_X_PERCENT = -2.5
 CALIBRATED_EXTEND_LEFT_PERCENT = 2.0
+
+QR_CODE_FILES = {
+    "1-connect-flyscanner-hotspot.png",
+    "2-open-hotspot-dashboard.png",
+    "3-open-network-dashboard.png",
+}
 
 
 @dataclass
@@ -250,6 +257,11 @@ def parse_args() -> argparse.Namespace:
         "--no-web",
         action="store_true",
         help="Disable the local web dashboard.",
+    )
+    parser.add_argument(
+        "--network-socket",
+        default="/run/flyscanner-network/control.sock",
+        help="Local control socket for fallback-hotspot Wi-Fi setup.",
     )
     parser.add_argument(
         "--run-now",
@@ -560,14 +572,21 @@ def show_network_info(
     lcd: CharacterLcd | NullLcd,
     web_port: int,
     display_seconds: float,
+    network_socket: str,
 ) -> None:
-    address = local_ipv4_address()
+    hotspot_active = False
+    try:
+        network_status = network_helper_request(network_socket, {"command": "status"})
+        hotspot_active = bool(network_status.get("ok") and network_status.get("hotspot_active"))
+    except Exception:
+        pass
+    address = "10.42.0.1" if hotspot_active else local_ipv4_address()
     hostname = socket.gethostname().split(".", 1)[0]
     if address is None:
         lcd.write("Network offline", "Try again later")
         print("Dashboard address unavailable: network is offline")
     else:
-        lcd.write(f"Dashboard :{web_port}", address)
+        lcd.write(f"{'Setup WiFi' if hotspot_active else 'Dashboard'} :{web_port}", address)
         print(f"Dashboard: http://{address}:{web_port}")
         print(f"mDNS shortcut: http://{hostname}.local:{web_port}")
     time.sleep(display_seconds)
@@ -1097,10 +1116,116 @@ def system_health(output_dir: Path) -> dict[str, float | None]:
     }
 
 
+def network_helper_request(socket_path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Send one bounded JSON request to the privileged local network helper."""
+    encoded = (json.dumps(payload) + "\n").encode("utf-8")
+    if len(encoded) > 65536:
+        raise ValueError("Network request is too large")
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(35.0)
+            client.connect(socket_path)
+            client.sendall(encoded)
+            response = client.makefile("rb").readline(65537)
+    except OSError as exc:
+        raise RuntimeError("Network setup helper is unavailable") from exc
+    if not response or len(response) > 65536:
+        raise RuntimeError("Network setup helper returned an invalid response")
+    decoded = json.loads(response.decode("utf-8"))
+    if not isinstance(decoded, dict):
+        raise RuntimeError("Network setup helper returned an invalid response")
+    return decoded
+
+
+def wifi_qr_escape(value: str) -> str:
+    """Escape special characters used by the common Wi-Fi QR payload format."""
+    escaped = value.replace("\\", "\\\\")
+    for character in (";", ",", ":", '"'):
+        escaped = escaped.replace(character, f"\\{character}")
+    return escaped
+
+
+def generate_qr_codes(qr_dir: Path, network_socket: str, web_port: int) -> list[Path]:
+    """Create or refresh the three device-specific printable QR PNGs."""
+    try:
+        import segno
+    except ImportError as exc:
+        raise RuntimeError(
+            "QR generator is missing; run .venv/bin/python -m pip install -r requirements-pi5.txt"
+        ) from exc
+
+    credentials = network_helper_request(network_socket, {"command": "credentials"})
+    if not credentials.get("ok"):
+        raise RuntimeError(str(credentials.get("error", "Could not read hotspot credentials")))
+    hotspot_ssid = credentials.get("hotspot_ssid")
+    hotspot_password = credentials.get("hotspot_password")
+    if not isinstance(hotspot_ssid, str) or not isinstance(hotspot_password, str):
+        raise RuntimeError("Network helper returned invalid hotspot credentials")
+
+    hostname = socket.gethostname().split(".", 1)[0]
+    payloads = {
+        "1-connect-flyscanner-hotspot.png": (
+            f"WIFI:T:WPA;S:{wifi_qr_escape(hotspot_ssid)};"
+            f"P:{wifi_qr_escape(hotspot_password)};;"
+        ),
+        "2-open-hotspot-dashboard.png": f"http://10.42.0.1:{web_port}",
+        "3-open-network-dashboard.png": f"http://{hostname}.local:{web_port}",
+    }
+    digests = {
+        name: hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        for name, payload in payloads.items()
+    }
+    qr_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        qr_dir.chmod(0o700)
+    except OSError:
+        pass
+    manifest_path = qr_dir / ".manifest.json"
+    try:
+        existing_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        existing_manifest = {}
+
+    generated: list[Path] = []
+    previous_digests = existing_manifest.get("digests", {})
+    for name, payload in payloads.items():
+        destination = qr_dir / name
+        if destination.is_file() and previous_digests.get(name) == digests[name]:
+            continue
+        temporary = qr_dir / f".{name}.tmp"
+        try:
+            segno.make(payload, error="m").save(
+                temporary,
+                kind="png",
+                scale=12,
+                border=4,
+                dark="#000000",
+                light="#ffffff",
+            )
+            temporary.chmod(0o600)
+            temporary.replace(destination)
+            generated.append(destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    temporary_manifest = qr_dir / ".manifest.json.tmp"
+    try:
+        temporary_manifest.write_text(
+            json.dumps({"version": 1, "digests": digests}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temporary_manifest.chmod(0o600)
+        temporary_manifest.replace(manifest_path)
+    finally:
+        temporary_manifest.unlink(missing_ok=True)
+    return generated
+
+
 class DashboardState:
-    def __init__(self, output_dir: Path, history_path: Path) -> None:
+    def __init__(self, output_dir: Path, history_path: Path, qr_dir: Path) -> None:
         self.output_dir = output_dir.resolve()
         self.history_path = history_path.resolve()
+        self.qr_dir = qr_dir.resolve()
         self._lock = threading.Lock()
         self._status = "starting"
         self._detail = "Initializing scanner"
@@ -1159,11 +1284,13 @@ class DashboardServer:
         host: str,
         port: int,
         dashboard_path: Path,
+        network_socket: str,
     ) -> None:
         self.state = state
         self.host = host
         self.port = port
         self.dashboard_path = dashboard_path
+        self.network_socket = network_socket
         self._stop_event = threading.Event()
         self._startup_event = threading.Event()
         self._startup_error: Exception | None = None
@@ -1246,6 +1373,53 @@ class DashboardServer:
                 raise web.HTTPNotFound(text="No scan history is available yet")
             return web.FileResponse(self.state.history_path)
 
+        async def qr_code(request: Any) -> Any:
+            name = request.match_info["name"]
+            if name not in QR_CODE_FILES:
+                raise web.HTTPNotFound()
+            path = self.state.qr_dir / name
+            if not path.is_file():
+                raise web.HTTPNotFound(text="QR code has not been generated yet")
+            return web.FileResponse(path)
+
+        async def network_status(_request: Any) -> Any:
+            try:
+                response = await asyncio.to_thread(
+                    network_helper_request, self.network_socket, {"command": "status"}
+                )
+            except Exception as exc:
+                return web.json_response({"ok": False, "error": str(exc)}, status=503)
+            return web.json_response(response, status=200 if response.get("ok") else 400)
+
+        async def network_scan(_request: Any) -> Any:
+            try:
+                response = await asyncio.to_thread(
+                    network_helper_request, self.network_socket, {"command": "scan"}
+                )
+            except Exception as exc:
+                return web.json_response({"ok": False, "error": str(exc)}, status=503)
+            return web.json_response(response, status=200 if response.get("ok") else 403)
+
+        async def network_connect(request: Any) -> Any:
+            try:
+                body = await request.json()
+                if not isinstance(body, dict):
+                    raise ValueError("Request must be an object")
+                ssid = body.get("ssid", "")
+                password = body.get("password", "")
+                if not isinstance(ssid, str) or not isinstance(password, str):
+                    raise ValueError("Wi-Fi name and password must be text")
+                response = await asyncio.to_thread(
+                    network_helper_request,
+                    self.network_socket,
+                    {"command": "connect", "ssid": ssid, "password": password},
+                )
+            except (ValueError, json.JSONDecodeError) as exc:
+                return web.json_response({"ok": False, "error": str(exc)}, status=400)
+            except Exception as exc:
+                return web.json_response({"ok": False, "error": str(exc)}, status=503)
+            return web.json_response(response, status=202 if response.get("ok") else 403)
+
         app = web.Application()
         app.add_routes(
             [
@@ -1254,6 +1428,10 @@ class DashboardServer:
                 web.get("/latest-image", latest_image),
                 web.get("/captures/{name}", capture_file),
                 web.get("/scan_history.csv", history_csv),
+                web.get("/qr/{name}", qr_code),
+                web.get("/api/network/status", network_status),
+                web.get("/api/network/scan", network_scan),
+                web.post("/api/network/connect", network_connect),
             ]
         )
         runner = web.AppRunner(app, access_log=None)
@@ -1405,17 +1583,37 @@ def main() -> int:
     illuminator = setup_illuminator(args)
     ir_enabled = False if args.no_ir else load_ir_capture_setting(args.state_file)
     history_path = args.output_dir / "scan_history.csv"
-    dashboard_state = DashboardState(args.output_dir, history_path)
+    qr_dir = Path(__file__).resolve().parent / "qr-codes"
+    dashboard_state = DashboardState(args.output_dir, history_path, qr_dir)
     dashboard_state.set_ir_enabled(ir_enabled)
     dashboard_server: DashboardServer | None = None
 
     try:
         if not args.no_web and not args.run_now and not args.test_button:
+            qr_error: Exception | None = None
+            for attempt in range(5):
+                try:
+                    generated_qr_codes = generate_qr_codes(
+                        qr_dir, args.network_socket, args.web_port
+                    )
+                    if generated_qr_codes:
+                        print(
+                            f"Generated {len(generated_qr_codes)} printable QR codes in {qr_dir}"
+                        )
+                    qr_error = None
+                    break
+                except Exception as exc:
+                    qr_error = exc
+                    if attempt < 4:
+                        time.sleep(1.0)
+            if qr_error is not None:
+                print(f"Warning: QR codes were not generated: {qr_error}", file=sys.stderr)
             dashboard_server = DashboardServer(
                 dashboard_state,
                 args.web_host,
                 args.web_port,
                 Path(__file__).resolve().parent / "dashboard.html",
+                args.network_socket,
             )
             dashboard_server.start()
 
@@ -1448,7 +1646,12 @@ def main() -> int:
                 hold_new_result = False
                 if action == "show_network":
                     dashboard_state.set_status("showing_network", "Dashboard address on LCD")
-                    show_network_info(lcd, args.web_port, args.network_display_time)
+                    show_network_info(
+                        lcd,
+                        args.web_port,
+                        args.network_display_time,
+                        args.network_socket,
+                    )
                     continue
                 if action == "ir_settings":
                     dashboard_state.set_status("ir_settings", "Waiting for selection")

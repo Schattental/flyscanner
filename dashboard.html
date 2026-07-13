@@ -23,6 +23,8 @@
     .image { grid-column:span 7; }
     .details { grid-column:span 5; }
     .history { grid-column:1/-1; overflow:auto; }
+    .network { grid-column:1/-1; }
+    .qr { grid-column:1/-1; }
     .big { color:var(--green); font-size:64px; font-weight:750; letter-spacing:-.06em; line-height:1; }
     .label,.muted { color:var(--muted); }
     .kv { display:grid; grid-template-columns:1fr auto; gap:10px 14px; }
@@ -32,8 +34,21 @@
     th,td { padding:10px 12px; border-bottom:1px solid var(--line); text-align:left; }
     th { color:var(--muted); font-weight:600; }
     a { color:var(--green); }
+    .network-form { display:grid; grid-template-columns:1fr 1fr auto; gap:10px; align-items:end; margin-top:14px; }
+    label { display:grid; gap:6px; color:var(--muted); }
+    input,select,button { min-height:42px; border:1px solid var(--line); border-radius:9px; padding:9px 11px; background:#0b1512; color:#edf8f4; font:inherit; }
+    button { cursor:pointer; background:#245f49; border-color:#398267; font-weight:650; }
+    button.secondary { background:#172923; }
+    button:disabled { cursor:not-allowed; opacity:.55; }
+    .network-actions { display:flex; gap:10px; flex-wrap:wrap; margin-top:10px; }
+    .notice { margin:12px 0 0; color:var(--muted); }
+    .notice.error { color:#ff9b8f; }
+    .qr-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:14px; }
+    .qr-item { margin:0; padding:14px; border:1px solid var(--line); border-radius:12px; background:#0b1512; text-align:center; }
+    .qr-item img { width:min(100%,280px); margin:0 auto 10px; border-radius:4px; image-rendering:pixelated; }
+    .qr-item figcaption { display:grid; gap:5px; }
     .empty { min-height:180px; display:grid; place-items:center; color:var(--muted); }
-    @media (max-width:760px) { .score,.status,.health,.image,.details { grid-column:1/-1; } main { margin-top:18px; } }
+    @media (max-width:760px) { .score,.status,.health,.image,.details { grid-column:1/-1; } .network-form,.qr-grid { grid-template-columns:1fr; } main { margin-top:18px; } }
   </style>
 </head>
 <body>
@@ -45,6 +60,8 @@
     <article class="card health"><h2>Device health</h2><div class="kv"><span>Temperature</span><span id="temp">—</span><span>Disk free</span><span id="disk">—</span><span>Disk used</span><span id="diskUsed">—</span></div></article>
     <article class="card image"><h2>Analysis alignment</h2><div id="imageEmpty" class="empty">The first completed scan will appear here.</div><img id="image" hidden alt="Latest analysis alignment frame"></article>
     <article class="card details"><h2>Latest capture</h2><div id="captureDetails" class="kv"><span class="muted">No capture metadata yet.</span></div><p><a id="video" hidden>Download latest video</a></p><p><a href="/scan_history.csv">Download complete CSV history</a></p></article>
+    <article id="networkCard" class="card network"><h2>Network</h2><div class="kv"><span>Mode</span><span id="networkMode">Checking…</span><span>Connection</span><span id="networkConnection">—</span></div><div id="wifiSetup" hidden><p class="notice">The scanner could not find a saved network. Choose Wi-Fi below; this page will disconnect while the scanner switches networks.</p><div class="network-actions"><button id="scanWifi" class="secondary" type="button">Scan nearby Wi-Fi</button></div><div class="network-form"><label>Nearby networks<select id="wifiList"><option value="">Select or enter a network</option></select></label><label>Wi-Fi name<input id="wifiSsid" maxlength="32" autocomplete="off" placeholder="Network name"></label><label>Password<input id="wifiPassword" type="password" maxlength="63" autocomplete="new-password" placeholder="Leave blank for open Wi-Fi"></label></div><div class="network-actions"><button id="saveWifi" type="button">Save and connect</button></div><p id="networkMessage" class="notice"></p></div></article>
+    <article class="card qr"><h2>Printable QR codes</h2><div class="qr-grid"><figure class="qr-item"><img src="/qr/1-connect-flyscanner-hotspot.png" alt="QR code for connecting to the Flyscanner setup hotspot"><figcaption><strong>1. Connect to Flyscanner</strong><span class="muted">Joins the temporary setup hotspot</span><a href="/qr/1-connect-flyscanner-hotspot.png" download>Download PNG</a></figcaption></figure><figure class="qr-item"><img src="/qr/2-open-hotspot-dashboard.png" alt="QR code for opening the dashboard through the setup hotspot"><figcaption><strong>2. Hotspot dashboard</strong><span class="muted">Opens 10.42.0.1 while setting up</span><a href="/qr/2-open-hotspot-dashboard.png" download>Download PNG</a></figcaption></figure><figure class="qr-item"><img src="/qr/3-open-network-dashboard.png" alt="QR code for opening the dashboard on a normal local network"><figcaption><strong>3. Network dashboard</strong><span class="muted">Opens flyscanner.local after setup</span><a href="/qr/3-open-network-dashboard.png" download>Download PNG</a></figcaption></figure></div></article>
     <article class="card history"><h2>Recent scans</h2><table><thead><tr><th>Time</th><th>Score</th><th>IR</th><th>FPS</th><th>Brightness</th><th>Locked controls</th></tr></thead><tbody id="history"><tr><td colspan="6" class="muted">No scans recorded.</td></tr></tbody></table></article>
   </section>
 </main>
@@ -93,7 +110,47 @@
     ws.onclose = () => { $('dot').classList.remove('online'); $('connection').textContent='Reconnecting'; setTimeout(connect,1500); };
     ws.onerror = () => ws.close();
   }
+  async function networkRequest(path, options={}) {
+    const response = await fetch(path, options);
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.error || 'Network request failed');
+    return data;
+  }
+  async function refreshNetwork() {
+    try {
+      const data = await networkRequest('/api/network/status');
+      $('networkMode').textContent = text(data.phase).replaceAll('_',' ');
+      $('networkConnection').textContent = data.hotspot_active ? `${data.hotspot_ssid} · 10.42.0.1` : (data.connection_name || data.detail || '—');
+      $('wifiSetup').hidden = !data.hotspot_active;
+    } catch (error) {
+      $('networkMode').textContent = 'Setup helper unavailable';
+      $('networkConnection').textContent = '—';
+      $('wifiSetup').hidden = true;
+    }
+  }
+  $('wifiList').addEventListener('change', event => { if (event.target.value) $('wifiSsid').value = event.target.value; });
+  $('scanWifi').addEventListener('click', async () => {
+    const button = $('scanWifi'); button.disabled = true; $('networkMessage').textContent = 'Scanning…'; $('networkMessage').classList.remove('error');
+    try {
+      const data = await networkRequest('/api/network/scan');
+      $('wifiList').replaceChildren(new Option('Select or enter a network',''), ...data.networks.map(network => new Option(`${network.ssid} · ${network.signal}% · ${network.security}`, network.ssid)));
+      $('networkMessage').textContent = data.networks.length ? 'Select a network or enter a hidden network name.' : 'No named networks found; enter the network name manually.';
+    } catch (error) { $('networkMessage').textContent = error.message; $('networkMessage').classList.add('error'); }
+    finally { button.disabled = false; }
+  });
+  $('saveWifi').addEventListener('click', async () => {
+    const ssid = $('wifiSsid').value.trim(), password = $('wifiPassword').value, button = $('saveWifi');
+    if (!ssid) { $('networkMessage').textContent = 'Enter or select a Wi-Fi name.'; $('networkMessage').classList.add('error'); return; }
+    button.disabled = true; $('networkMessage').textContent = 'Saving settings…'; $('networkMessage').classList.remove('error');
+    try {
+      const data = await networkRequest('/api/network/connect', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ssid,password})});
+      $('wifiPassword').value = ''; $('networkMessage').textContent = data.message;
+      $('networkMode').textContent = 'Switching networks';
+    } catch (error) { $('networkMessage').textContent = error.message; $('networkMessage').classList.add('error'); button.disabled = false; }
+  });
   connect();
+  refreshNetwork();
+  setInterval(refreshNetwork,5000);
 </script>
 </body>
 </html>
