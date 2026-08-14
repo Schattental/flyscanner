@@ -99,10 +99,10 @@ has the following behavior:
 - Long press on the IR screen: save both displayed settings and return.
 
 The confirmed choices are stored in `flyscanner_state.json` and loaded again
-after service restarts and reboots. Existing state files containing only the IR
-choice are accepted and start with the new 30-second runtime. The LEDs remain
-physically off while the scanner is idle even when the displayed capture
-setting is ON.
+after service restarts and reboots. Advanced settings saved on the website use
+the same file. Existing state files containing only the IR choice are accepted
+and start with the new 30-second runtime. The LEDs remain physically off while
+the scanner is idle even when the displayed capture setting is ON.
 
 The 24-hour choice is stored as one session made of 144 independent 10-minute
 captures. Each part gets its own score, MP4, first-frame JPEG, JSON, and CSV row,
@@ -120,26 +120,26 @@ Capture cleanup counts the complete set as one session, not as 144 unrelated
 runs. There is a short camera warm-up and one-second score display between
 parts, so the session's wall-clock time is a few minutes longer than 24 hours.
 
-Capture and analysis remain at 1280x720/30 FPS, while the saved video is
-compressed live to 960x540 grayscale H.264 MP4 using `veryfast`, CRF 21, and two
-encoder threads. Testing the same real source produced these estimates:
+The camera still captures at 1280x720/30 FPS, but unused pixels outside the
+calibrated 746x720 analysis region are no longer sent to the video encoder. The
+same cropped frame object feeds both the analyzer and encoder. The default
+746x720 saved height therefore has no spatial downscaling and represents the
+exact native ROI used for analysis; H.264 is still lossy and the saved copy is
+converted to grayscale. Encoding uses `veryfast`, CRF 21, and two threads.
 
-- 1280x720 color CRF 18: about 87 GB per 24 recorded hours
-- 1280x720 grayscale CRF 21: about 38 GB
-- 960x540 grayscale CRF 21: about 13 GB
-- 854x480 grayscale CRF 21: about 7.5 GB
+Matched live 30-second tests under the same lighting measured:
 
-Grayscale alone saved only 6-8%; resolution and CRF produced most of the gain.
-The 960x540 choice retained good visual alignment/detail while leaving the
-full-resolution analysis unchanged. A subsequent live test captured and
-analyzed all 455 frames with zero drops, produced an exact 30 FPS stream, and
-used 1.46 MB over 15.17 seconds. That calmer scene projects to about 8.3 GB for
-24 recorded hours; the noisier benchmark projects about 13 GB, demonstrating
-why file size varies with content. Before opening the camera, the scanner
-estimates the total from recordings made with matching video settings, adds 50%
-headroom for scene variation, preserves another 1 GiB free, and refuses a
-session that would fill the drive. Ten-minute parts also limit the amount at
-risk if power is interrupted.
+- Native 746x720 ROI: 70.73 MiB per ten-minute part, about 9.95 GiB for all 144
+  parts.
+- Reduced 560x540 ROI: 19.85 MiB per ten-minute part, about 2.79 GiB for all 144
+  parts.
+
+Both tests captured and analyzed every frame at about 30.23 FPS with zero
+drops. File size varies with scene detail and motion, so these are estimates,
+not fixed limits. Before opening the camera, the scanner estimates the total
+from recordings made with matching video settings, adds 50% headroom, preserves
+another 1 GiB free, and refuses a session that would fill the drive. Ten-minute
+parts also limit the amount at risk if power is interrupted.
 
 Dashboard capture/analysis FPS uses camera processing time and excludes MP4
 finalization. Tiny deviations around 30 (for example 30.28) are normal camera
@@ -147,10 +147,13 @@ buffer/timing effects; `ffprobe` confirmed the saved MP4 itself is exactly 30
 FPS. The first analysis frame is now correctly counted even though it serves as
 the motion baseline.
 
-Use `--video-codec mjpeg` only for the old large AVI format. H.264 output can be
-adjusted with `--video-width`, `--video-height`, `--video-crf`,
-`--video-preset`, and `--video-encoder-threads`. Use
-`--no-video-grayscale` when color is genuinely needed.
+Use `--video-codec mjpeg` only for the old large AVI format. ROI-only storage is
+the default; `--video-height 540` selects the smaller version and its width is
+derived automatically to preserve aspect ratio. Use `--no-video-roi-only` to
+retain the full camera frame, where `--video-width` applies directly. H.264 can
+also be adjusted with `--video-crf`, `--video-preset`, and
+`--video-encoder-threads`. Use `--no-video-grayscale` when color is genuinely
+needed.
 
 Immediately after recording, the LCD switches directly to the activity score
 and holds it for six seconds. It then alternates every two seconds between the
@@ -235,13 +238,40 @@ scanner reaches it through a local socket accessible only to root and the
 
 ## 5. Open the local dashboard
 
-The service hosts a read-only dashboard on port 8080. It uses a WebSocket for
-live scanner status, selected runtime, result, IR state, temperature, disk
-space, and recent scan updates. It also provides the latest alignment image,
-the complete master history CSV, and a video download control. Enter how many
-of the most recent completed recordings to download; the default is one (the
-latest). Multiple videos are streamed together as a `.tar` archive without
+The service hosts a live dashboard and scanner controls on port 8080. It uses a
+WebSocket for scanner status, selected runtime, result, IR state, temperature,
+disk space, and recent scan updates. It also provides the latest alignment
+image, the complete master history CSV, and a video download control. Enter how
+many of the most recent completed recordings to download; the default is one
+(the latest). Multiple videos are streamed together as a `.tar` archive without
 creating a second large archive file on the Pi.
+
+The **Remote control and advanced settings** card can start a scan and configure
+the camera device and capture mode, IR, motion analysis, saved-video compression
+and resolution, retention, and physical-interface timing. Runtime deliberately
+offers only the physical device's four presets: 30 seconds, 5 minutes, 10
+minutes, and 24 hours. Website and physical runtime/IR changes update the same
+state, so the LCD, dashboard, next capture, and rebooted service remain in sync.
+
+- **Save settings** queues validated changes; they apply as soon as the scanner
+  is idle and are then written atomically to `flyscanner_state.json`.
+- **Save and start scan** first saves the visible settings, then queues a scan.
+  Starting the 24-hour preset requires an extra browser confirmation.
+- **Stop current scan** requests a graceful stop. A partial video and score are
+  retained if enough frames were captured; an extremely early stop may have no
+  usable result.
+- Camera settings are checked for safe ranges, valid crop geometry, and even
+  H.264 dimensions. The camera itself may still negotiate a different mode or
+  reject an unsupported mode; that error is reported without killing the boot
+  service.
+- **Save only the analysis ROI** is enabled by default. At saved height 720 the
+  stored video is the native 746x720 input used by analysis; height 540 selects
+  a smaller 560x540 playback copy without lowering analysis resolution.
+
+GPIO assignments, output paths, and the dashboard host/port remain in
+`/etc/default/flyscanner`. They are intentionally not live controls because a
+mistaken GPIO assignment can conflict with connected hardware and a bind change
+can disconnect the page being used.
 
 Find the Pi's address:
 
@@ -356,12 +386,14 @@ raspi-config`, then choose **Interface Options** and **SSH**. Prefer SSH
 public-key authentication and disable password authentication after confirming
 that key login works.
 
-The dashboard intentionally has no capture or GPIO controls and no
-authentication. Wi-Fi changes are accepted only while the protected setup
-hotspot is active. Keep normal dashboard access on a trusted local network and
-do not forward port 8080 from your router to the internet. Change the port with
-`--web-port PORT`, bind only to one interface with `--web-host ADDRESS`, or turn
-it off with `--no-web` in `/etc/default/flyscanner`.
+The dashboard intentionally has no login. Its scanner controls are available to
+anyone who can reach port 8080; cross-origin browser requests are rejected, but
+that is not authentication. Wi-Fi changes are accepted only while the protected
+setup hotspot is active. Keep dashboard access on a trusted local network, use
+the per-device hotspot password, and do not forward port 8080 from your router
+to the internet. Change the port with `--web-port PORT`, bind only to one
+interface with `--web-host ADDRESS`, or turn it off with `--no-web` in
+`/etc/default/flyscanner`.
 
 Useful administration commands:
 

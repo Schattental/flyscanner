@@ -23,6 +23,8 @@ import asyncio
 import csv
 import hashlib
 import json
+import math
+import queue
 import re
 import shutil
 import signal
@@ -36,6 +38,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 cv2 = None
 np = None
@@ -55,6 +58,10 @@ QR_CODE_FILES = {
     "3-open-network-dashboard.png",
 }
 
+
+class ScanCancelled(Exception):
+    """Raised when a remote stop request arrives before usable frames exist."""
+
 RUNTIME_PRESETS_SECONDS = (30, 5 * 60, 10 * 60, 24 * 60 * 60)
 DEFAULT_RUNTIME_SECONDS = RUNTIME_PRESETS_SECONDS[0]
 DEFAULT_VIDEO_BYTES_PER_SECOND = 4_000_000
@@ -64,6 +71,41 @@ STORAGE_ESTIMATE_SAFETY_FACTOR = 1.5
 LONG_SESSION_SEGMENT_SECONDS = 10 * 60
 DASHBOARD_HISTORY_LIMIT = 1000
 
+SCANNER_SETTING_KEYS = {
+    "duration_seconds",
+    "ir_enabled",
+    "camera_device",
+    "capture_width",
+    "capture_height",
+    "capture_fps",
+    "camera_buffers",
+    "warmup_seconds",
+    "camera_lock",
+    "fixed_framerate",
+    "analysis_width",
+    "analyze_every",
+    "opencv_threads",
+    "motion_threshold",
+    "min_change_area",
+    "dark_threshold",
+    "analysis_shift_x",
+    "analysis_extend_left",
+    "video_codec",
+    "video_roi_only",
+    "video_width",
+    "video_height",
+    "video_grayscale",
+    "video_crf",
+    "video_preset",
+    "video_encoder_threads",
+    "keep_captures",
+    "result_hold_seconds",
+    "button_debounce_seconds",
+    "long_press_seconds",
+    "double_press_window_seconds",
+    "network_display_seconds",
+}
+
 
 @dataclass
 class ActivityResult:
@@ -72,6 +114,7 @@ class ActivityResult:
     first_frame_path: str
     ir_enabled: bool
     video_codec: str
+    video_roi_only: bool
     video_width: int
     video_height: int
     video_grayscale: bool
@@ -137,14 +180,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--video-width",
         type=int,
-        default=960,
-        help="Saved H.264 video width; capture and analysis remain at full resolution.",
+        default=746,
+        help="Saved H.264 width when keeping the full frame. ROI-only mode derives width from height.",
     )
     parser.add_argument(
         "--video-height",
         type=int,
-        default=540,
-        help="Saved H.264 video height; capture and analysis remain at full resolution.",
+        default=720,
+        help="Saved H.264 video height; 720 preserves the native analysis ROI resolution.",
+    )
+    parser.add_argument(
+        "--video-roi-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save only the calibrated analysis ROI (default); use --no-video-roi-only for the full frame.",
     )
     parser.add_argument(
         "--video-grayscale",
@@ -536,6 +585,248 @@ def preset_runtime(value: float | int) -> int:
     return min(RUNTIME_PRESETS_SECONDS, key=lambda candidate: abs(candidate - numeric))
 
 
+def state_document(state_file: Path) -> dict[str, Any]:
+    if not state_file.exists():
+        return {}
+    with state_file.open("r", encoding="utf-8") as file:
+        document = json.load(file)
+    if not isinstance(document, dict):
+        raise ValueError("settings must be an object")
+    return document
+
+
+def write_state_document(state_file: Path, document: dict[str, Any]) -> None:
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = state_file.with_name(f".{state_file.name}.tmp")
+    try:
+        with temporary_path.open("w", encoding="utf-8") as file:
+            json.dump(document, file, indent=2)
+            file.write("\n")
+        temporary_path.replace(state_file)
+    except OSError:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
+def scanner_settings_from_args(
+    args: argparse.Namespace, ir_enabled: bool, duration_seconds: int
+) -> dict[str, Any]:
+    return {
+        "duration_seconds": int(duration_seconds),
+        "ir_enabled": bool(ir_enabled),
+        "camera_device": str(args.camera),
+        "capture_width": int(args.width),
+        "capture_height": int(args.height),
+        "capture_fps": float(args.fps),
+        "camera_buffers": int(args.camera_buffers),
+        "warmup_seconds": float(args.warmup),
+        "camera_lock": not bool(args.no_camera_lock),
+        "fixed_framerate": not bool(args.allow_dynamic_framerate),
+        "analysis_width": int(args.analysis_width),
+        "analyze_every": int(args.analyze_every),
+        "opencv_threads": int(args.opencv_threads),
+        "motion_threshold": int(args.motion_threshold),
+        "min_change_area": int(args.min_change_area),
+        "dark_threshold": int(args.dark_threshold),
+        "analysis_shift_x": float(args.analysis_shift_x),
+        "analysis_extend_left": float(args.analysis_extend_left),
+        "video_codec": str(args.video_codec),
+        "video_roi_only": bool(args.video_roi_only),
+        "video_width": int(args.video_width),
+        "video_height": int(args.video_height),
+        "video_grayscale": bool(args.video_grayscale),
+        "video_crf": int(args.video_crf),
+        "video_preset": str(args.video_preset),
+        "video_encoder_threads": int(args.video_encoder_threads),
+        "keep_captures": int(args.keep_captures),
+        "result_hold_seconds": float(args.result_hold),
+        "button_debounce_seconds": float(args.button_debounce),
+        "long_press_seconds": float(args.long_press),
+        "double_press_window_seconds": float(args.double_press_window),
+        "network_display_seconds": float(args.network_display_time),
+    }
+
+
+def validate_scanner_settings(
+    payload: dict[str, Any], current: dict[str, Any]
+) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("settings must be an object")
+    unknown = set(payload) - SCANNER_SETTING_KEYS
+    if unknown:
+        raise ValueError(f"Unknown setting: {sorted(unknown)[0]}")
+    settings = dict(current)
+    settings.update(payload)
+
+    def integer(name: str, minimum: int, maximum: int) -> int:
+        value = settings.get(name)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{name} must be a whole number")
+        numeric = int(value)
+        if numeric != value or not minimum <= numeric <= maximum:
+            raise ValueError(f"{name} must be between {minimum} and {maximum}")
+        return numeric
+
+    def decimal(name: str, minimum: float, maximum: float) -> float:
+        value = settings.get(name)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{name} must be a number")
+        numeric = float(value)
+        if not math.isfinite(numeric) or not minimum <= numeric <= maximum:
+            raise ValueError(f"{name} must be between {minimum:g} and {maximum:g}")
+        return numeric
+
+    def boolean(name: str) -> bool:
+        value = settings.get(name)
+        if not isinstance(value, bool):
+            raise ValueError(f"{name} must be true or false")
+        return value
+
+    duration = integer("duration_seconds", 1, 24 * 60 * 60)
+    if duration not in RUNTIME_PRESETS_SECONDS:
+        raise ValueError("duration_seconds must be 30, 300, 600, or 86400")
+    settings["duration_seconds"] = duration
+    settings["ir_enabled"] = boolean("ir_enabled")
+    camera_device = settings.get("camera_device")
+    if not isinstance(camera_device, str) or not camera_device.strip():
+        raise ValueError("camera_device must be a camera path or numeric index")
+    if len(camera_device) > 256 or "\x00" in camera_device:
+        raise ValueError("camera_device is not valid")
+    settings["camera_device"] = camera_device.strip()
+    settings["capture_width"] = integer("capture_width", 320, 3840)
+    settings["capture_height"] = integer("capture_height", 240, 2160)
+    settings["capture_fps"] = decimal("capture_fps", 1, 120)
+    settings["camera_buffers"] = integer("camera_buffers", 1, 16)
+    settings["warmup_seconds"] = decimal("warmup_seconds", 0, 30)
+    settings["camera_lock"] = boolean("camera_lock")
+    settings["fixed_framerate"] = boolean("fixed_framerate")
+    settings["analysis_width"] = integer("analysis_width", 0, 3840)
+    settings["analyze_every"] = integer("analyze_every", 1, 30)
+    settings["opencv_threads"] = integer("opencv_threads", 1, 4)
+    settings["motion_threshold"] = integer("motion_threshold", 0, 255)
+    settings["min_change_area"] = integer("min_change_area", 0, 100_000)
+    settings["dark_threshold"] = integer("dark_threshold", 0, 255)
+    settings["analysis_shift_x"] = decimal("analysis_shift_x", -20, 20)
+    settings["analysis_extend_left"] = decimal("analysis_extend_left", 0, 30)
+    codec = settings.get("video_codec")
+    if codec not in {"h264", "mjpeg"}:
+        raise ValueError("video_codec must be h264 or mjpeg")
+    settings["video_codec"] = codec
+    settings["video_roi_only"] = boolean("video_roi_only")
+    settings["video_width"] = integer(
+        "video_width", 2 if settings["video_roi_only"] else 320, 3840
+    )
+    settings["video_height"] = integer("video_height", 240, 2160)
+    if settings["video_roi_only"] and codec == "h264":
+        settings["video_width"], settings["video_height"] = roi_video_output_size(
+            settings["capture_width"],
+            settings["capture_height"],
+            settings["analysis_shift_x"],
+            settings["analysis_extend_left"],
+            settings["video_height"],
+        )
+    if codec == "h264" and (settings["video_width"] % 2 or settings["video_height"] % 2):
+        raise ValueError("H.264 video width and height must be even")
+    settings["video_grayscale"] = boolean("video_grayscale")
+    settings["video_crf"] = integer("video_crf", 0, 51)
+    preset = settings.get("video_preset")
+    if preset not in {"ultrafast", "superfast", "veryfast"}:
+        raise ValueError("video_preset must be ultrafast, superfast, or veryfast")
+    settings["video_preset"] = preset
+    settings["video_encoder_threads"] = integer("video_encoder_threads", 1, 4)
+    settings["keep_captures"] = integer("keep_captures", 0, 20)
+    settings["result_hold_seconds"] = decimal("result_hold_seconds", 0, 30)
+    settings["button_debounce_seconds"] = decimal(
+        "button_debounce_seconds", 0, 2
+    )
+    settings["long_press_seconds"] = decimal("long_press_seconds", 0.5, 5)
+    settings["double_press_window_seconds"] = decimal(
+        "double_press_window_seconds", 0.2, 2
+    )
+    settings["network_display_seconds"] = decimal("network_display_seconds", 1, 30)
+    analysis_region_geometry(
+        settings["capture_height"],
+        settings["capture_width"],
+        settings["analysis_shift_x"],
+        settings["analysis_extend_left"],
+    )
+    return settings
+
+
+def apply_scanner_settings(args: argparse.Namespace, settings: dict[str, Any]) -> None:
+    args.camera = settings["camera_device"]
+    args.width = settings["capture_width"]
+    args.height = settings["capture_height"]
+    args.fps = settings["capture_fps"]
+    args.camera_buffers = settings["camera_buffers"]
+    args.warmup = settings["warmup_seconds"]
+    args.no_camera_lock = not settings["camera_lock"]
+    args.allow_dynamic_framerate = not settings["fixed_framerate"]
+    args.analysis_width = settings["analysis_width"]
+    args.analyze_every = settings["analyze_every"]
+    args.opencv_threads = settings["opencv_threads"]
+    args.motion_threshold = settings["motion_threshold"]
+    args.min_change_area = settings["min_change_area"]
+    args.dark_threshold = settings["dark_threshold"]
+    args.analysis_shift_x = settings["analysis_shift_x"]
+    args.analysis_extend_left = settings["analysis_extend_left"]
+    args.video_codec = settings["video_codec"]
+    args.video_roi_only = settings["video_roi_only"]
+    args.video_width = settings["video_width"]
+    args.video_height = settings["video_height"]
+    args.video_grayscale = settings["video_grayscale"]
+    args.video_crf = settings["video_crf"]
+    args.video_preset = settings["video_preset"]
+    args.video_encoder_threads = settings["video_encoder_threads"]
+    args.keep_captures = settings["keep_captures"]
+    args.result_hold = settings["result_hold_seconds"]
+    args.button_debounce = settings["button_debounce_seconds"]
+    args.long_press = settings["long_press_seconds"]
+    args.double_press_window = settings["double_press_window_seconds"]
+    args.network_display_time = settings["network_display_seconds"]
+    args.duration = float(settings["duration_seconds"])
+    if cv2 is not None:
+        cv2.setNumThreads(max(args.opencv_threads, 1))
+
+
+def load_saved_web_settings(
+    state_file: Path, current: dict[str, Any]
+) -> dict[str, Any]:
+    try:
+        document = state_document(state_file)
+        saved = document.get("web_settings", {})
+        if not isinstance(saved, dict):
+            raise ValueError("web_settings must be an object")
+        saved = dict(saved)
+        if "video_roi_only" not in saved:
+            # Migrate the old full-frame 960x540 default to the native analysis
+            # ROI at 746x720. Preserve explicitly customized sizes.
+            saved["video_roi_only"] = True
+            if saved.get("video_width") == 960 and saved.get("video_height") == 540:
+                saved["video_width"] = 746
+                saved["video_height"] = 720
+        return validate_scanner_settings(saved, current)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        print(f"Warning: could not load advanced web settings: {exc}", file=sys.stderr)
+        return validate_scanner_settings({}, current)
+
+
+def save_full_scanner_settings(state_file: Path, settings: dict[str, Any]) -> None:
+    validated = validate_scanner_settings(settings, settings)
+    try:
+        document = state_document(state_file)
+    except (OSError, ValueError, json.JSONDecodeError):
+        document = {}
+    document["ir_enabled"] = validated["ir_enabled"]
+    document["duration_seconds"] = validated["duration_seconds"]
+    document["web_settings"] = {
+        key: value
+        for key, value in validated.items()
+        if key not in {"ir_enabled", "duration_seconds"}
+    }
+    write_state_document(state_file, document)
+
+
 def load_scanner_settings(
     state_file: Path,
     default_ir: bool = True,
@@ -545,10 +836,7 @@ def load_scanner_settings(
         return default_ir, preset_runtime(default_duration)
 
     try:
-        with state_file.open("r", encoding="utf-8") as file:
-            settings = json.load(file)
-        if not isinstance(settings, dict):
-            raise ValueError("settings must be an object")
+        settings = state_document(state_file)
         ir_enabled = settings.get("ir_enabled", default_ir)
         duration_seconds = settings.get("duration_seconds", default_duration)
         if not isinstance(ir_enabled, bool):
@@ -570,23 +858,13 @@ def load_scanner_settings(
 def save_scanner_settings(state_file: Path, ir_enabled: bool, duration_seconds: int) -> None:
     if duration_seconds not in RUNTIME_PRESETS_SECONDS:
         raise ValueError("duration_seconds is not a supported preset")
-    state_file.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = state_file.with_name(f".{state_file.name}.tmp")
     try:
-        with temporary_path.open("w", encoding="utf-8") as file:
-            json.dump(
-                {"ir_enabled": ir_enabled, "duration_seconds": duration_seconds},
-                file,
-                indent=2,
-            )
-            file.write("\n")
-        temporary_path.replace(state_file)
-    except OSError:
-        try:
-            temporary_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
+        document = state_document(state_file)
+    except (OSError, ValueError, json.JSONDecodeError):
+        document = {}
+    document["ir_enabled"] = ir_enabled
+    document["duration_seconds"] = duration_seconds
+    write_state_document(state_file, document)
 
 
 def wait_for_idle_action(
@@ -601,7 +879,8 @@ def wait_for_idle_action(
     hold_new_result: bool = False,
     result_hold_seconds: float = 6.0,
     double_press_window: float = 0.6,
-) -> str:
+    dashboard: DashboardState | None = None,
+) -> str | dict[str, Any]:
     print(
         f"Waiting for button on GPIO{gpio_number} "
         f"(runtime: {runtime_label(duration_seconds)}, "
@@ -619,6 +898,9 @@ def wait_for_idle_action(
     )
     last_lcd_mode: str | None = None
     while not button.is_pressed:
+        remote_command = dashboard.take_idle_command() if dashboard is not None else None
+        if remote_command is not None:
+            return remote_command
         now = time.monotonic()
         if last_result is None:
             mode = "prompt"
@@ -662,6 +944,9 @@ def wait_for_idle_action(
     time.sleep(min(debounce_seconds, 0.08))
     second_press_deadline = released_at + double_press_window
     while time.monotonic() < second_press_deadline:
+        remote_command = dashboard.take_idle_command() if dashboard is not None else None
+        if remote_command is not None:
+            return remote_command
         if button.is_pressed:
             while button.is_pressed:
                 time.sleep(0.02)
@@ -1041,6 +1326,7 @@ def make_video_writer(
     path: Path,
     fps: float,
     frame_size: tuple[int, int],
+    output_size: tuple[int, int],
 ) -> Any:
     if args.video_codec == "h264":
         return FfmpegH264Writer(
@@ -1050,7 +1336,7 @@ def make_video_writer(
             args.video_crf,
             args.video_preset,
             args.video_encoder_threads,
-            (args.video_width, args.video_height),
+            output_size,
             args.video_grayscale,
         )
 
@@ -1085,6 +1371,25 @@ def analysis_region_geometry(
             "analysis-shift-x or analysis-extend-left"
         )
     return left, 0, right - left, height
+
+
+def roi_video_output_size(
+    capture_width: int,
+    capture_height: int,
+    shift_x_percent: float,
+    extend_left_percent: float,
+    output_height: int,
+) -> tuple[int, int]:
+    """Return an even H.264 size that preserves the calibrated ROI aspect."""
+    _, _, roi_width, roi_height = analysis_region_geometry(
+        capture_height,
+        capture_width,
+        shift_x_percent,
+        extend_left_percent,
+    )
+    scaled_width = output_height * roi_width / max(roi_height, 1)
+    even_width = max(2, int(round(scaled_width / 2.0)) * 2)
+    return even_width, output_height
 
 
 def analysis_region(
@@ -1193,6 +1498,7 @@ class LiveActivityAnalyzer:
             first_frame_path=str(first_frame_path),
             ir_enabled=metadata["ir_enabled"],
             video_codec=metadata["video_codec"],
+            video_roi_only=metadata["video_roi_only"],
             video_width=metadata["video_width"],
             video_height=metadata["video_height"],
             video_grayscale=metadata["video_grayscale"],
@@ -1257,6 +1563,9 @@ def capture_video(
         warmup_end = time.monotonic() + args.warmup
         last_warmup_second = -1
         while time.monotonic() < warmup_end:
+            if dashboard is not None and dashboard.cancel_requested():
+                cap.release()
+                raise ScanCancelled("Scan cancelled during camera warm-up")
             remaining = max(0, int(round(warmup_end - time.monotonic())))
             if remaining != last_warmup_second:
                 lcd.write("Warming camera", f"{remaining}s")
@@ -1275,6 +1584,10 @@ def capture_video(
         # reflects the locked settings.
         for _ in range(3):
             cap.read()
+
+    if dashboard is not None and dashboard.cancel_requested():
+        cap.release()
+        raise ScanCancelled("Scan cancelled before recording")
 
     ok, frame = cap.read()
     if not ok or frame is None:
@@ -1312,7 +1625,34 @@ def capture_video(
         f"(0=black, 255=white)"
     )
 
-    writer = make_video_writer(args, video_path, negotiated_fps, (width, height))
+    video_frame_size = (
+        (crop_width, crop_height) if args.video_roi_only else (width, height)
+    )
+    if args.video_codec == "h264":
+        video_output_size = (
+            roi_video_output_size(
+                width,
+                height,
+                args.analysis_shift_x,
+                args.analysis_extend_left,
+                args.video_height,
+            )
+            if args.video_roi_only
+            else (args.video_width, args.video_height)
+        )
+    else:
+        video_output_size = video_frame_size
+    print(
+        f"Saved video view: {'analysis ROI' if args.video_roi_only else 'full frame'} "
+        f"at {video_output_size[0]}x{video_output_size[1]}"
+    )
+    writer = make_video_writer(
+        args,
+        video_path,
+        negotiated_fps,
+        video_frame_size,
+        video_output_size,
+    )
     analyzer = LiveActivityAnalyzer(args.motion_threshold, args.min_change_area, args.dark_threshold)
 
     start = time.monotonic()
@@ -1332,6 +1672,9 @@ def capture_video(
             elapsed = time.monotonic() - start
             if elapsed >= args.duration:
                 break
+            if dashboard is not None and dashboard.cancel_requested():
+                print("Remote cancellation requested; finalizing partial recording")
+                break
 
             ok, frame = cap.read()
             if not ok or frame is None:
@@ -1339,11 +1682,20 @@ def capture_video(
                 print("Warning: dropped camera frame", file=sys.stderr)
                 continue
 
-            writer.write(frame)
+            roi_frame = (
+                analysis_region(frame, args.analysis_shift_x, args.analysis_extend_left)
+                if args.video_roi_only
+                else None
+            )
+            writer.write(roi_frame if roi_frame is not None else frame)
             frame_count += 1
             if frame_count % max(args.analyze_every, 1) == 0:
-                analysis_frame = analysis_region(
-                    frame, args.analysis_shift_x, args.analysis_extend_left
+                analysis_frame = (
+                    roi_frame
+                    if roi_frame is not None
+                    else analysis_region(
+                        frame, args.analysis_shift_x, args.analysis_extend_left
+                    )
                 )
                 analysis_height, analysis_width = analysis_frame.shape[:2]
                 if 0 < args.analysis_width < analysis_width:
@@ -1387,14 +1739,17 @@ def capture_video(
     # Encoder finalization may take a moment and is not part of camera capture.
     actual_duration = max(capture_ended - start, 0.001)
     if frame_count < 2:
+        if dashboard is not None and dashboard.cancel_requested():
+            raise ScanCancelled("Scan cancelled before enough frames were captured")
         raise RuntimeError("Not enough frames were captured to analyze activity.")
 
     metadata: dict[str, Any] = {
         "scan_timestamp": scan_timestamp,
         "ir_enabled": ir_enabled,
         "video_codec": args.video_codec,
-        "video_width": args.video_width if args.video_codec == "h264" else width,
-        "video_height": args.video_height if args.video_codec == "h264" else height,
+        "video_roi_only": args.video_roi_only,
+        "video_width": video_output_size[0],
+        "video_height": video_output_size[1],
         "video_grayscale": args.video_grayscale if args.video_codec == "h264" else False,
         "video_crf": args.video_crf if args.video_codec == "h264" else None,
         "capture_width": width,
@@ -1520,6 +1875,7 @@ def estimated_video_bytes_per_second(
     height: int,
     fps: float,
     video_codec: str,
+    video_roi_only: bool,
     video_width: int,
     video_height: int,
     video_grayscale: bool,
@@ -1534,6 +1890,8 @@ def estimated_video_bytes_per_second(
                 video_path = output_dir / video_path.name
             if video_path.suffix.lower() != video_extension(video_codec):
                 continue
+            if bool(metadata.get("video_roi_only", False)) != video_roi_only:
+                continue
             if video_codec == "h264" and (
                 int(metadata.get("video_width", 0)) != video_width
                 or int(metadata.get("video_height", 0)) != video_height
@@ -1544,13 +1902,22 @@ def estimated_video_bytes_per_second(
             duration = float(metadata["duration_seconds"])
             size = video_path.stat().st_size
             if duration > 0 and size > 0:
-                recorded_width = max(1, int(metadata.get("capture_width", width)))
-                recorded_height = max(1, int(metadata.get("capture_height", height)))
+                recorded_width = max(1, int(metadata.get("video_width", width)))
+                recorded_height = max(1, int(metadata.get("video_height", height)))
                 recorded_fps = max(1.0, float(metadata.get("fps_estimate", fps)))
                 if video_codec == "h264":
                     scale = fps / recorded_fps
                 else:
-                    scale = (width * height * fps) / (
+                    if video_roi_only:
+                        _, _, current_width, current_height = analysis_region_geometry(
+                            height,
+                            width,
+                            CALIBRATED_SHIFT_X_PERCENT,
+                            CALIBRATED_EXTEND_LEFT_PERCENT,
+                        )
+                    else:
+                        current_width, current_height = width, height
+                    scale = (current_width * current_height * fps) / (
                         recorded_width * recorded_height * recorded_fps
                     )
                 measured_rates.append(size / duration * scale)
@@ -1586,6 +1953,7 @@ def ensure_capture_storage(args: argparse.Namespace) -> tuple[int, int]:
         args.height,
         args.fps,
         args.video_codec,
+        args.video_roi_only,
         args.video_width,
         args.video_height,
         args.video_grayscale,
@@ -1744,6 +2112,12 @@ class DashboardState:
         self._detail = "Initializing scanner"
         self._ir_enabled = False
         self._duration_seconds = DEFAULT_RUNTIME_SECONDS
+        self._ir_available = True
+        self._settings: dict[str, Any] = {}
+        self._commands: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._scan_active = False
+        self._scan_queued = False
+        self._cancel_event = threading.Event()
         self._history: deque[dict[str, Any]] = deque(
             load_recent_history(history_path), maxlen=DASHBOARD_HISTORY_LIMIT
         )
@@ -1760,9 +2134,72 @@ class DashboardState:
         with self._lock:
             self._ir_enabled = enabled
 
+    def set_ir_available(self, available: bool) -> None:
+        with self._lock:
+            self._ir_available = available
+
+    def ir_available(self) -> bool:
+        with self._lock:
+            return self._ir_available
+
     def set_duration(self, duration_seconds: int) -> None:
         with self._lock:
             self._duration_seconds = duration_seconds
+
+    def set_settings(self, settings: dict[str, Any]) -> None:
+        with self._lock:
+            self._settings = dict(settings)
+            self._duration_seconds = int(settings["duration_seconds"])
+            self._ir_enabled = bool(settings["ir_enabled"])
+
+    def settings_snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return dict(self._settings)
+
+    def request_settings(self, settings: dict[str, Any]) -> None:
+        self._commands.put({"type": "settings", "settings": dict(settings)})
+
+    def request_scan(self) -> tuple[bool, str]:
+        with self._lock:
+            if self._scan_active:
+                return False, "A scan is already running"
+            if self._scan_queued:
+                return False, "A remote scan is already queued"
+            if self._status not in {"ready"}:
+                return False, f"Scanner is currently {self._status.replace('_', ' ')}"
+            self._scan_queued = True
+        self._commands.put({"type": "scan"})
+        return True, "Scan queued"
+
+    def take_idle_command(self) -> dict[str, Any] | None:
+        try:
+            return self._commands.get_nowait()
+        except queue.Empty:
+            return None
+
+    def begin_scan(self) -> None:
+        with self._lock:
+            self._scan_active = True
+            self._scan_queued = False
+        self._cancel_event.clear()
+
+    def end_scan(self) -> None:
+        with self._lock:
+            self._scan_active = False
+            self._scan_queued = False
+        self._cancel_event.clear()
+
+    def request_cancel(self) -> tuple[bool, str]:
+        with self._lock:
+            if not self._scan_active:
+                return False, "No scan is currently running"
+            self._status = "cancelling"
+            self._detail = "Finishing the current partial recording"
+        self._cancel_event.set()
+        return True, "Cancellation requested"
+
+    def cancel_requested(self) -> bool:
+        return self._cancel_event.is_set()
 
     def publish_result(self, result: ActivityResult) -> None:
         row = asdict(result)
@@ -1807,7 +2244,12 @@ class DashboardState:
                 "status": self._status,
                 "detail": self._detail,
                 "ir_enabled": self._ir_enabled,
+                "ir_available": self._ir_available,
                 "duration_seconds": self._duration_seconds,
+                "settings": dict(self._settings),
+                "scan_active": self._scan_active,
+                "scan_queued": self._scan_queued,
+                "cancel_requested": self._cancel_event.is_set(),
                 "latest_result": dict(self._latest_result) if self._latest_result else None,
                 "history": [dict(row) for row in list(self._history)[-20:]],
             }
@@ -1969,6 +2411,75 @@ class DashboardServer:
                 raise web.HTTPNotFound(text="No scan history is available yet")
             return web.FileResponse(self.state.history_path)
 
+        def require_same_origin(request: Any) -> None:
+            origin = request.headers.get("Origin")
+            if origin and urlsplit(origin).netloc != request.host:
+                raise web.HTTPForbidden(text="Cross-origin scanner control is not allowed")
+
+        async def scanner_settings_get(_request: Any) -> Any:
+            return web.json_response(
+                {
+                    "ok": True,
+                    "settings": self.state.settings_snapshot(),
+                    "runtime_presets": [
+                        {"seconds": value, "label": runtime_label(value)}
+                        for value in RUNTIME_PRESETS_SECONDS
+                    ],
+                }
+            )
+
+        async def scanner_settings_update(request: Any) -> Any:
+            require_same_origin(request)
+            try:
+                body = await request.json()
+                if not isinstance(body, dict):
+                    raise ValueError("Request must be an object")
+                payload = body.get("settings")
+                validated = validate_scanner_settings(
+                    payload, self.state.settings_snapshot()
+                )
+                if validated["ir_enabled"] and not self.state.ir_available():
+                    raise ValueError("IR control is disabled on this scanner")
+                self.state.request_settings(validated)
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                return web.json_response({"ok": False, "error": str(exc)}, status=400)
+            return web.json_response(
+                {
+                    "ok": True,
+                    "message": "Settings queued and will apply when the scanner is idle",
+                    "settings": validated,
+                },
+                status=202,
+            )
+
+        async def scanner_start(request: Any) -> Any:
+            require_same_origin(request)
+            try:
+                body = await request.json()
+                if not isinstance(body, dict) or body.get("confirm") is not True:
+                    raise ValueError("Explicit confirmation is required")
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                return web.json_response({"ok": False, "error": str(exc)}, status=400)
+            accepted, message = self.state.request_scan()
+            return web.json_response(
+                {"ok": accepted, "message": message, "error": None if accepted else message},
+                status=202 if accepted else 409,
+            )
+
+        async def scanner_cancel(request: Any) -> Any:
+            require_same_origin(request)
+            try:
+                body = await request.json()
+                if not isinstance(body, dict) or body.get("confirm") is not True:
+                    raise ValueError("Explicit confirmation is required")
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                return web.json_response({"ok": False, "error": str(exc)}, status=400)
+            accepted, message = self.state.request_cancel()
+            return web.json_response(
+                {"ok": accepted, "message": message, "error": None if accepted else message},
+                status=202 if accepted else 409,
+            )
+
         async def qr_code(request: Any) -> Any:
             name = request.match_info["name"]
             if name not in QR_CODE_FILES:
@@ -2041,6 +2552,10 @@ class DashboardServer:
                 web.get("/captures/{name}", capture_file),
                 web.get("/download-videos", download_videos),
                 web.get("/scan_history.csv", history_csv),
+                web.get("/api/scanner/settings", scanner_settings_get),
+                web.put("/api/scanner/settings", scanner_settings_update),
+                web.post("/api/scanner/start", scanner_start),
+                web.post("/api/scanner/cancel", scanner_cancel),
                 web.get("/qr/{name}", qr_code),
                 web.get("/api/network/status", network_status),
                 web.get("/api/network/scan", network_scan),
@@ -2215,6 +2730,9 @@ def run_selected_scan(
                 session_progress=progress,
                 check_storage=False,
             )
+            if dashboard is not None and dashboard.cancel_requested():
+                print(f"24-hour session cancelled after {progress}")
+                break
             if part_number < total_parts:
                 lcd.write(f"Part {part_number:03d} score", f"{latest_result.activity_score:.2f}")
                 if dashboard is not None:
@@ -2294,12 +2812,20 @@ def main() -> int:
     )
     ir_enabled = False if args.no_ir else saved_ir_enabled
     if not args.run_now:
-        args.duration = float(saved_duration)
+        base_settings = scanner_settings_from_args(args, ir_enabled, saved_duration)
+        scanner_settings = load_saved_web_settings(args.state_file, base_settings)
+        scanner_settings["duration_seconds"] = saved_duration
+        scanner_settings["ir_enabled"] = ir_enabled
+        apply_scanner_settings(args, scanner_settings)
+    else:
+        scanner_settings = scanner_settings_from_args(
+            args, ir_enabled, int(args.duration)
+        )
     history_path = args.output_dir / "scan_history.csv"
     qr_dir = Path(__file__).resolve().parent / "qr-codes"
     dashboard_state = DashboardState(args.output_dir, history_path, qr_dir)
-    dashboard_state.set_ir_enabled(ir_enabled)
-    dashboard_state.set_duration(int(args.duration))
+    dashboard_state.set_ir_available(not args.no_ir)
+    dashboard_state.set_settings(scanner_settings)
     dashboard_server: DashboardServer | None = None
 
     try:
@@ -2357,8 +2883,37 @@ def main() -> int:
                     hold_new_result,
                     args.result_hold,
                     args.double_press_window,
+                    dashboard_state,
                 )
                 hold_new_result = False
+                if isinstance(action, dict):
+                    command_type = action.get("type")
+                    if command_type == "settings":
+                        try:
+                            pending_settings = validate_scanner_settings(
+                                action.get("settings"),
+                                scanner_settings_from_args(
+                                    args, ir_enabled, int(args.duration)
+                                ),
+                            )
+                            if args.no_ir:
+                                pending_settings["ir_enabled"] = False
+                            apply_scanner_settings(args, pending_settings)
+                            ir_enabled = bool(pending_settings["ir_enabled"])
+                            save_full_scanner_settings(args.state_file, pending_settings)
+                            dashboard_state.set_settings(pending_settings)
+                            lcd.write("Web settings", "Saved")
+                            print("Applied and saved advanced web settings")
+                            time.sleep(0.6)
+                        except Exception as exc:
+                            dashboard_state.set_status("settings_error", str(exc))
+                            print(f"Could not apply web settings: {exc}", file=sys.stderr)
+                        continue
+                    if command_type == "scan":
+                        action = "scan"
+                    else:
+                        print(f"Ignoring unknown dashboard command: {command_type}", file=sys.stderr)
+                        continue
                 if action == "show_network":
                     dashboard_state.set_status("showing_network", "Dashboard address on LCD")
                     show_network_info(
@@ -2381,15 +2936,30 @@ def main() -> int:
                         ir_available=not args.no_ir,
                     )
                     args.duration = float(selected_duration)
-                    dashboard_state.set_duration(selected_duration)
-                    dashboard_state.set_ir_enabled(ir_enabled)
+                    dashboard_state.set_settings(
+                        scanner_settings_from_args(
+                            args, ir_enabled, selected_duration
+                        )
+                    )
                     continue
 
+                dashboard_state.begin_scan()
                 try:
                     last_result = run_selected_scan(
                         args, lcd, illuminator, ir_enabled, dashboard_state
                     )
                     hold_new_result = True
+                    if dashboard_state.cancel_requested():
+                        dashboard_state.set_status(
+                            "scan_cancelled", "Partial recording saved"
+                        )
+                        lcd.write("Scan cancelled", "Partial saved")
+                        time.sleep(1.0)
+                except ScanCancelled as exc:
+                    dashboard_state.set_status("scan_cancelled", str(exc))
+                    lcd.write("Scan cancelled", "No result saved")
+                    print(str(exc))
+                    time.sleep(1.0)
                 except Exception as exc:
                     dashboard_state.set_status("scan_error", str(exc))
                     lcd.write("Scan error", str(exc)[:16])
@@ -2397,6 +2967,8 @@ def main() -> int:
                     # Stay alive under systemd; a reconnect or corrected setup can be
                     # tested with the next button press.
                     time.sleep(1.0)
+                finally:
+                    dashboard_state.end_scan()
         finally:
             button.close()
     finally:

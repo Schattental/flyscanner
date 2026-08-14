@@ -1,14 +1,16 @@
 # Optional command-line overrides used by flyscanner.service.
 # The defaults are 1280x720, 30 FPS, USB camera /dev/video0, GPIO26 button,
 # full-resolution analysis shifted 2.5% left and extended another 2% left at
-# 30 FPS with four camera buffers, 960x540 grayscale CRF-21 H.264 MP4 video, IR
+# 30 FPS with four camera buffers, native 746x720 ROI-only grayscale CRF-21
+# H.264 MP4 video, IR
 # illuminator on GPIO16, 16x2 LCD enabled, and output in ./captures.
 FLYSCANNER_ARGS=
 
 # Examples (uncomment one line, keeping the value on a single line):
 # FLYSCANNER_ARGS=--camera /dev/video2 --width 1920 --height 1080 --fps 30
 # FLYSCANNER_ARGS=--camera-buffers 4
-# FLYSCANNER_ARGS=--video-codec h264 --video-width 960 --video-height 540 --video-grayscale --video-crf 21 --video-preset veryfast --video-encoder-threads 2
+# FLYSCANNER_ARGS=--video-codec h264 --video-roi-only --video-height 720 --video-grayscale --video-crf 21 --video-preset veryfast --video-encoder-threads 2
+# FLYSCANNER_ARGS=--video-codec h264 --video-roi-only --video-height 540 --video-grayscale --video-crf 21
 # FLYSCANNER_ARGS=--video-codec mjpeg
 # FLYSCANNER_ARGS=--no-lcd
 # FLYSCANNER_ARGS=--ir-gpio 16

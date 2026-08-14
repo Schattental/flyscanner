@@ -28,6 +28,7 @@
     .image { grid-column:span 7; }
     .details { grid-column:span 5; }
     .history { grid-column:1/-1; overflow:auto; }
+    .controls { grid-column:1/-1; }
     .network { grid-column:1/-1; }
     .qr { grid-column:1/-1; }
     .big { color:var(--green); font-size:64px; font-weight:750; letter-spacing:-.06em; line-height:1; }
@@ -53,6 +54,19 @@
     button.danger { background:#512723; border-color:#a74c43; }
     button:disabled { cursor:not-allowed; opacity:.55; }
     .network-actions { display:flex; gap:10px; flex-wrap:wrap; margin-top:10px; }
+    .control-head { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; }
+    .control-head h2 { margin-bottom:5px; }
+    .control-buttons { display:flex; gap:10px; flex-wrap:wrap; justify-content:flex-end; }
+    .settings-form { margin-top:16px; }
+    .settings-groups { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
+    .settings-group { padding:14px; border:1px solid var(--line); border-radius:12px; background:#0b1512; }
+    .settings-group summary { cursor:pointer; color:#dff7ed; font-weight:700; }
+    .settings-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin-top:14px; }
+    .settings-grid .wide { grid-column:1/-1; }
+    .field-note { color:var(--muted); font-size:12px; line-height:1.35; }
+    .toggle { display:flex; align-items:center; gap:9px; min-height:42px; padding:9px 11px; border:1px solid var(--line); border-radius:9px; background:#0b1512; color:#edf8f4; }
+    .toggle input { min-height:0; width:18px; height:18px; margin:0; }
+    .settings-actions { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-top:14px; }
     .notice { margin:12px 0 0; color:var(--muted); }
     .notice.error { color:#ff9b8f; }
     .qr-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:14px; }
@@ -81,7 +95,7 @@
     .reference-table th:first-child,.reference-table td:first-child { width:31%; }
     .reference-table td { vertical-align:top; line-height:1.45; }
     .reference-table code { overflow-wrap:anywhere; }
-    @media (max-width:760px) { .score,.status,.health,.image,.details { grid-column:1/-1; } .network-form,.qr-grid,.download-row { grid-template-columns:1fr; } main { margin-top:18px; } header { align-items:flex-start; } .header-actions { display:grid; justify-items:end; } .help-tabs { display:grid; grid-template-columns:1fr 1fr; } .reference-table th:first-child,.reference-table td:first-child { width:42%; } }
+    @media (max-width:760px) { .score,.status,.health,.image,.details { grid-column:1/-1; } .network-form,.qr-grid,.download-row,.settings-groups,.settings-grid { grid-template-columns:1fr; } .settings-grid .wide { grid-column:auto; } main { margin-top:18px; } header,.control-head { align-items:flex-start; } .header-actions { display:grid; justify-items:end; } .control-head { display:grid; } .control-buttons { justify-content:flex-start; } .help-tabs { display:grid; grid-template-columns:1fr 1fr; } .reference-table th:first-child,.reference-table td:first-child { width:42%; } }
   </style>
 </head>
 <body>
@@ -91,6 +105,57 @@
     <article class="card score"><div><div class="label">Latest activity</div><div id="score" class="big">—</div></div><div id="scanTime" class="muted">No completed scans</div></article>
     <article class="card status"><h2>Scanner</h2><div class="kv"><span>Status</span><span id="status">Starting</span><span>Detail</span><span id="detail">—</span><span>Selected runtime</span><span id="runtime">—</span><span>IR during capture</span><span id="ir">—</span></div></article>
     <article class="card health"><h2>Device health</h2><div class="kv"><span>Temperature</span><span id="temp">—</span><span>Disk free</span><span id="disk">—</span><span>Disk used</span><span id="diskUsed">—</span></div></article>
+    <article class="card controls">
+      <div class="control-head"><div><h2>Remote control and advanced settings</h2><div class="muted">Changes persist across reboots and apply when the scanner is idle.</div></div><div class="control-buttons"><button id="startScan" type="button" disabled>Save and start scan</button><button id="cancelScan" class="danger" type="button" disabled>Stop current scan</button></div></div>
+      <form id="scannerSettings" class="settings-form">
+        <div class="settings-groups">
+          <details class="settings-group" open><summary>Operation and storage</summary><div class="settings-grid">
+            <label>Runtime<select id="setDuration"><option value="30">30 seconds</option><option value="300">5 minutes</option><option value="600">10 minutes</option><option value="86400">24 hours (144 × 10 min)</option></select><span class="field-note">The same four presets used by the physical controls.</span></label>
+            <label>Retained prior sessions<input id="setKeepCaptures" type="number" min="0" max="20" step="1"><span class="field-note">0 keeps only the current session. A complete 24-hour run counts as one session.</span></label>
+            <label class="toggle wide"><input id="setIrEnabled" type="checkbox">Use IR illumination during capture</label>
+          </div></details>
+          <details class="settings-group"><summary>Camera capture</summary><div class="settings-grid">
+            <label class="wide">Camera device<input id="setCameraDevice" type="text" maxlength="256" placeholder="/dev/video0"><span class="field-note">Use a V4L2 path such as /dev/video0 or a numeric OpenCV index.</span></label>
+            <label>Capture width<input id="setCaptureWidth" type="number" min="320" max="3840" step="2"></label>
+            <label>Capture height<input id="setCaptureHeight" type="number" min="240" max="2160" step="2"></label>
+            <label>Requested FPS<input id="setCaptureFps" type="number" min="1" max="120" step="1"></label>
+            <label>Camera buffers<input id="setCameraBuffers" type="number" min="1" max="16" step="1"><span class="field-note">Four is tested for stable USB throughput.</span></label>
+            <label>Warm-up seconds<input id="setWarmup" type="number" min="0" max="30" step="0.1"></label>
+            <span></span>
+            <label class="toggle"><input id="setCameraLock" type="checkbox">Lock exposure, white balance and focus</label>
+            <label class="toggle"><input id="setFixedFramerate" type="checkbox">Prevent exposure from lowering FPS</label>
+          </div></details>
+          <details class="settings-group"><summary>Motion analysis</summary><div class="settings-grid">
+            <label>Analysis resize width<input id="setAnalysisWidth" type="number" min="0" max="3840" step="1"><span class="field-note">0 keeps the full calibrated crop.</span></label>
+            <label>Analyze every Nth frame<input id="setAnalyzeEvery" type="number" min="1" max="30" step="1"><span class="field-note">1 analyzes every captured frame.</span></label>
+            <label>OpenCV threads<input id="setOpenCvThreads" type="number" min="1" max="4" step="1"></label>
+            <label>Motion threshold<input id="setMotionThreshold" type="number" min="0" max="255" step="1"><span class="field-note">Higher ignores more pixel-level changes.</span></label>
+            <label>Minimum motion-blob area<input id="setMinChangeArea" type="number" min="0" max="100000" step="1"><span class="field-note">0 disables blob-size filtering.</span></label>
+            <label>Dark/fly threshold<input id="setDarkThreshold" type="number" min="0" max="255" step="1"><span class="field-note">0 uses automatic Otsu thresholding.</span></label>
+            <label>ROI horizontal shift (%)<input id="setAnalysisShift" type="number" min="-20" max="20" step="0.1"></label>
+            <label>ROI extend left (%)<input id="setAnalysisExtend" type="number" min="0" max="30" step="0.1"></label>
+          </div></details>
+          <details class="settings-group"><summary>Saved video</summary><div class="settings-grid">
+            <label>Codec<select id="setVideoCodec"><option value="h264">H.264 MP4</option><option value="mjpeg">MJPEG AVI (large)</option></select></label>
+            <label>Compression preset<select id="setVideoPreset"><option value="veryfast">Veryfast (recommended)</option><option value="superfast">Superfast</option><option value="ultrafast">Ultrafast</option></select></label>
+            <label class="toggle wide"><input id="setVideoRoiOnly" type="checkbox">Save only the analysis ROI</label>
+            <label>Saved width<input id="setVideoWidth" type="number" min="320" max="3840" step="2"><span id="videoWidthNote" class="field-note">Set directly for full-frame video.</span></label>
+            <label>Saved height<input id="setVideoHeight" type="number" min="240" max="2160" step="2"><span class="field-note">Use 720 for the native 746×720 analysis resolution or 540 for a smaller 560×540 copy.</span></label>
+            <label>H.264 CRF<input id="setVideoCrf" type="number" min="0" max="51" step="1"><span class="field-note">Lower means higher quality and larger files; 21 is balanced.</span></label>
+            <label>Encoder threads<input id="setEncoderThreads" type="number" min="1" max="4" step="1"></label>
+            <label class="toggle wide"><input id="setVideoGrayscale" type="checkbox">Save video in grayscale</label>
+          </div></details>
+          <details class="settings-group"><summary>Physical interface timing</summary><div class="settings-grid">
+            <label>Result hold (seconds)<input id="setResultHold" type="number" min="0" max="30" step="0.1"></label>
+            <label>Button debounce (seconds)<input id="setButtonDebounce" type="number" min="0" max="2" step="0.01"></label>
+            <label>Long press (seconds)<input id="setLongPress" type="number" min="0.5" max="5" step="0.1"></label>
+            <label>Double-press window (seconds)<input id="setDoubleWindow" type="number" min="0.2" max="2" step="0.1"></label>
+            <label>Network display (seconds)<input id="setNetworkDisplay" type="number" min="1" max="30" step="0.1"></label>
+          </div></details>
+        </div>
+        <div class="settings-actions"><button id="saveSettings" type="submit" disabled>Save settings</button><button id="reloadSettings" class="secondary" type="button" disabled>Discard unsaved changes</button><span id="scannerControlMessage" class="notice">Loading scanner settings…</span></div>
+      </form>
+    </article>
     <article class="card image"><h2>Analysis alignment</h2><div id="imageEmpty" class="empty">The first completed scan will appear here.</div><img id="image" hidden alt="Latest analysis alignment frame"></article>
     <article class="card details"><h2>Latest capture</h2><div id="captureDetails" class="kv"><span class="muted">No capture metadata yet.</span></div><div id="downloadPanel" class="download-panel" hidden><div class="download-row"><label>Number of recent videos<input id="videoCount" type="number" min="1" value="1" inputmode="numeric"></label><a id="downloadVideos" class="button-link" href="/download-videos?count=1">Download latest video</a></div><span id="videoAvailability" class="muted"></span></div><p><a class="button-link secondary" href="/scan_history.csv" download>Download CSV history</a></p></article>
     <article id="networkCard" class="card network"><h2>Network</h2><div class="kv"><span>Mode</span><span id="networkMode">Checking…</span><span>Connection</span><span id="networkConnection">—</span></div><div id="wifiSetup" hidden><p class="notice">The scanner could not find a saved network. Choose Wi-Fi below; this page will disconnect while the scanner switches networks.</p><div class="network-actions"><button id="scanWifi" class="secondary" type="button">Scan nearby Wi-Fi</button></div><div class="network-form"><label>Nearby networks<select id="wifiList"><option value="">Select or enter a network</option></select></label><label>Wi-Fi name<input id="wifiSsid" maxlength="32" autocomplete="off" placeholder="Network name"></label><label>Password<input id="wifiPassword" type="password" maxlength="63" autocomplete="new-password" placeholder="Leave blank for open Wi-Fi"></label></div><div class="network-actions"><button id="saveWifi" type="button">Save and connect</button></div><p id="networkMessage" class="notice"></p></div><div id="wifiForget" hidden><p class="notice">Remove the current Wi-Fi credentials. Flyscanner tries other saved networks before returning to setup-hotspot mode.</p><div class="network-actions"><button id="forgetWifi" class="danger" type="button">Forget current Wi-Fi</button></div><p id="forgetMessage" class="notice"></p></div></article>
@@ -108,7 +173,7 @@
     <section id="analysisHelp" class="help-panel" role="tabpanel" aria-labelledby="analysisTab">
       <h3>How each recording is analyzed</h3>
       <ol class="analysis-steps">
-        <li>The camera captures at full 1280×720 resolution. The calibrated analysis region is cropped from each frame; changing saved-video resolution does not reduce analysis resolution.</li>
+        <li>The camera captures at full 1280×720 resolution. The calibrated analysis region is cropped once and that same cropped frame is sent to both analysis and, by default, the video encoder. At a saved height of 720, the video retains the native 746×720 ROI resolution; choosing 540 scales only the stored copy while analysis remains full resolution.</li>
         <li>Each analysis frame is converted to grayscale. A small Gaussian blur is applied only to the copy used for frame-to-frame motion comparison. Neighboring pixels are gently averaged so isolated sensor noise, compression speckles, and tiny brightness fluctuations do not look like movement. Real fly motion covers coherent groups of pixels and remains detectable. The unblurred grayscale frame is retained for brightness measurement and dark/fly classification.</li>
         <li>A dark-pixel threshold identifies likely flies. It is normally estimated from the first frame with Otsu thresholding<sup aria-label="See Otsu thresholding footnote">*</sup> and constrained to a safe range, or it can be supplied manually.</li>
         <li>The intersection of the motion mask and dark-pixel mask becomes the <em>moving-fly</em> mask. This makes moving dark objects count more strongly than general lighting or background movement.</li>
@@ -143,6 +208,7 @@ score = (35 × 0.2) + (15 × 0.5) = 14.5</div>
           <tr><td><code>first_frame_path</code></td><td>Path to the JPEG showing the exact cropped analysis region from the first frame.</td></tr>
           <tr><td><code>ir_enabled</code></td><td>Whether the IR illuminator was enabled during this recording.</td></tr>
           <tr><td><code>video_codec</code></td><td>Saved-video codec selection: normally <code>h264</code>, or <code>mjpeg</code> for the legacy format.</td></tr>
+          <tr><td><code>video_roi_only</code></td><td>Whether the saved video contains exactly the calibrated analysis region instead of the unused full camera frame.</td></tr>
           <tr><td><code>video_width</code></td><td>Width of the saved playback video in pixels. This can be lower than capture/analysis width.</td></tr>
           <tr><td><code>video_height</code></td><td>Height of the saved playback video in pixels.</td></tr>
           <tr><td><code>video_grayscale</code></td><td>Whether color was removed from the saved video. Analysis always uses grayscale internally.</td></tr>
@@ -185,6 +251,60 @@ score = (35 × 0.2) + (15 × 0.5) = 14.5</div>
   let lastImageKey = '';
   let currentWifiName = '';
   let availableVideos = 0;
+  let currentServerSettings = null;
+  let settingsLoaded = false;
+  let settingsDirty = false;
+  let pendingSettingsKey = '';
+  const scannerSettingFields = {
+    duration_seconds:['setDuration','number'], ir_enabled:['setIrEnabled','boolean'], camera_device:['setCameraDevice','string'],
+    capture_width:['setCaptureWidth','number'], capture_height:['setCaptureHeight','number'], capture_fps:['setCaptureFps','number'], camera_buffers:['setCameraBuffers','number'], warmup_seconds:['setWarmup','number'], camera_lock:['setCameraLock','boolean'], fixed_framerate:['setFixedFramerate','boolean'],
+    analysis_width:['setAnalysisWidth','number'], analyze_every:['setAnalyzeEvery','number'], opencv_threads:['setOpenCvThreads','number'], motion_threshold:['setMotionThreshold','number'], min_change_area:['setMinChangeArea','number'], dark_threshold:['setDarkThreshold','number'], analysis_shift_x:['setAnalysisShift','number'], analysis_extend_left:['setAnalysisExtend','number'],
+    video_codec:['setVideoCodec','string'], video_roi_only:['setVideoRoiOnly','boolean'], video_width:['setVideoWidth','number'], video_height:['setVideoHeight','number'], video_grayscale:['setVideoGrayscale','boolean'], video_crf:['setVideoCrf','number'], video_preset:['setVideoPreset','string'], video_encoder_threads:['setEncoderThreads','number'], keep_captures:['setKeepCaptures','number'],
+    result_hold_seconds:['setResultHold','number'], button_debounce_seconds:['setButtonDebounce','number'], long_press_seconds:['setLongPress','number'], double_press_window_seconds:['setDoubleWindow','number'], network_display_seconds:['setNetworkDisplay','number'],
+  };
+  for (const [id,type] of Object.values(scannerSettingFields)) if (type!=='boolean') $(id).required=true;
+  function updateVideoRoiControls() {
+    const roiOnly=$('setVideoRoiOnly').checked;
+    $('setVideoWidth').disabled=roiOnly;
+    $('videoWidthNote').textContent=roiOnly ? 'Calculated automatically to preserve the ROI aspect ratio.' : 'Set directly for full-frame video.';
+  }
+  function settingsKey(settings) { return JSON.stringify(settings,Object.keys(settings).sort()); }
+  function populateScannerSettings(settings) {
+    if (!settings) return;
+    for (const [name,[id,type]] of Object.entries(scannerSettingFields)) {
+      const field=$(id), value=settings[name];
+      if (value === undefined) continue;
+      if (type === 'boolean') field.checked=Boolean(value); else field.value=String(value);
+    }
+    settingsLoaded=true; settingsDirty=false; currentServerSettings={...settings};
+    updateVideoRoiControls();
+    $('saveSettings').disabled=false; $('reloadSettings').disabled=false;
+  }
+  function readScannerSettings() {
+    if (!$('scannerSettings').reportValidity()) throw new Error('Correct the highlighted setting first.');
+    const settings={};
+    for (const [name,[id,type]] of Object.entries(scannerSettingFields)) {
+      const field=$(id);
+      settings[name]=type==='boolean' ? field.checked : type==='number' ? Number(field.value) : field.value;
+    }
+    return settings;
+  }
+  function showScannerMessage(message,error=false) {
+    $('scannerControlMessage').textContent=message;
+    $('scannerControlMessage').classList.toggle('error',error);
+  }
+  async function scannerRequest(path,options={}) {
+    const response=await fetch(path,options), data=await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.error || data.message || 'Scanner request failed');
+    return data;
+  }
+  async function saveScannerSettings(showMessage=true) {
+    const settings=readScannerSettings();
+    const data=await scannerRequest('/api/scanner/settings',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({settings})});
+    pendingSettingsKey=settingsKey(data.settings); populateScannerSettings(data.settings);
+    if (showMessage) showScannerMessage(data.message);
+    return data.settings;
+  }
   const helpTabs = [$('analysisTab'),$('csvTab')];
   function selectHelpTab(selectedTab) {
     for (const tab of helpTabs) {
@@ -235,6 +355,15 @@ score = (35 × 0.2) + (15 × 0.5) = 14.5</div>
     $('detail').textContent = text(data.detail);
     $('runtime').textContent = runtimeText(data.duration_seconds);
     $('ir').textContent = data.ir_enabled ? 'ON' : 'OFF';
+    if (data.settings) {
+      const incomingKey=settingsKey(data.settings);
+      currentServerSettings={...data.settings};
+      if (pendingSettingsKey && incomingKey===pendingSettingsKey) pendingSettingsKey='';
+      if (!settingsLoaded || (!settingsDirty && !pendingSettingsKey)) populateScannerSettings(data.settings);
+    }
+    $('setIrEnabled').disabled=data.ir_available===false;
+    $('startScan').disabled=Boolean(data.scan_active || data.scan_queued || data.status!=='ready');
+    $('cancelScan').disabled=!data.scan_active || Boolean(data.cancel_requested);
     availableVideos = Number(data.available_videos) || 0;
     updateVideoDownload();
     $('temp').textContent = data.health.temperature_c == null ? '—' : `${data.health.temperature_c} °C`;
@@ -254,7 +383,7 @@ score = (35 × 0.2) + (15 × 0.5) = 14.5</div>
       const rows = [
         ['File',String(result.video_path).split('/').pop()],
         ['Capture resolution',`${result.capture_width}×${result.capture_height}`],
-        ['Saved video',result.video_width ? `${result.video_width}×${result.video_height} · ${result.video_grayscale ? 'grayscale' : 'color'} · ${String(result.video_codec).toUpperCase()}${result.video_crf == null ? '' : ` CRF ${result.video_crf}`}` : 'Legacy format'],
+        ['Saved video',result.video_width ? `${result.video_width}×${result.video_height} · ${result.video_roi_only ? 'analysis ROI' : 'full frame'} · ${result.video_grayscale ? 'grayscale' : 'color'} · ${String(result.video_codec).toUpperCase()}${result.video_crf == null ? '' : ` CRF ${result.video_crf}`}` : 'Legacy format'],
         ['Analysis ROI',`${result.analysis_roi_width}×${result.analysis_roi_height} at x=${result.analysis_roi_left}`],
         ['Captured FPS',Number(result.fps_estimate).toFixed(2)],
         ['Analysis FPS',Number(result.analysis_fps_estimate).toFixed(2)],
@@ -267,6 +396,33 @@ score = (35 × 0.2) + (15 × 0.5) = 14.5</div>
     const rows = [...data.history].reverse().slice(0,20);
     $('history').innerHTML = rows.length ? rows.map(r => `<tr><td>${esc(String(r.video_path).split('/').pop())}</td><td>${esc(r.scan_timestamp)}</td><td>${esc(r.activity_score)}</td><td>${String(r.ir_enabled).toLowerCase()==='true'?'ON':'OFF'}</td><td>${esc(r.fps_estimate)}</td><td>${esc(r.brightness_mean)}</td><td>${esc(r.camera_locked_controls || '—')}</td></tr>`).join('') : '<tr><td colspan="7" class="muted">No scans recorded.</td></tr>';
   }
+  $('scannerSettings').addEventListener('input', () => { settingsDirty=true; });
+  $('scannerSettings').addEventListener('change', () => { settingsDirty=true; });
+  $('setVideoRoiOnly').addEventListener('change', updateVideoRoiControls);
+  $('scannerSettings').addEventListener('submit', async event => {
+    event.preventDefault(); $('saveSettings').disabled=true; showScannerMessage('Saving settings…');
+    try { await saveScannerSettings(); } catch (error) { showScannerMessage(error.message,true); }
+    finally { $('saveSettings').disabled=false; }
+  });
+  $('reloadSettings').addEventListener('click', () => { populateScannerSettings(currentServerSettings); pendingSettingsKey=''; showScannerMessage('Unsaved changes discarded.'); });
+  $('startScan').addEventListener('click', async () => {
+    const button=$('startScan'); button.disabled=true;
+    try {
+      const settings=await saveScannerSettings(false);
+      if (Number(settings.duration_seconds)===86400 && !confirm('Start a 24-hour session?\n\nThis creates 144 individually scored ten-minute recordings and runs slightly longer than 24 wall-clock hours.')) { button.disabled=false; return; }
+      showScannerMessage('Starting scan…');
+      const data=await scannerRequest('/api/scanner/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirm:true})});
+      showScannerMessage(data.message);
+    } catch (error) { showScannerMessage(error.message,true); button.disabled=false; }
+  });
+  $('cancelScan').addEventListener('click', async () => {
+    if (!confirm('Stop the current scan?\n\nThe completed partial video and score will be saved when enough frames are available.')) return;
+    const button=$('cancelScan'); button.disabled=true;
+    try {
+      const data=await scannerRequest('/api/scanner/cancel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirm:true})});
+      showScannerMessage(data.message);
+    } catch (error) { showScannerMessage(error.message,true); button.disabled=false; }
+  });
   $('videoCount').addEventListener('input', updateVideoDownload);
   function connect() {
     const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
