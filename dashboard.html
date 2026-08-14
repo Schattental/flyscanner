@@ -111,7 +111,8 @@
         <div class="settings-groups">
           <details class="settings-group" open><summary>Operation and storage</summary><div class="settings-grid">
             <label>Runtime<select id="setDuration"><option value="30">30 seconds</option><option value="300">5 minutes</option><option value="600">10 minutes</option><option value="86400">24 hours (144 × 10 min)</option></select><span class="field-note">The same four presets used by the physical controls.</span></label>
-            <label>Retained prior sessions<input id="setKeepCaptures" type="number" min="0" max="20" step="1"><span class="field-note">0 keeps only the current session. A complete 24-hour run counts as one session.</span></label>
+            <label>Total sessions kept<input id="setKeepCaptures" type="number" min="1" max="20" step="1"><span class="field-note">Includes the newest session. A complete 24-hour run counts as one session, even though it contains 144 parts.</span></label>
+            <span id="storageForecast" class="field-note wide">Calculating default 720p storage estimate…</span>
             <label class="toggle wide"><input id="setIrEnabled" type="checkbox">Use IR illumination during capture</label>
           </div></details>
           <details class="settings-group"><summary>Camera capture</summary><div class="settings-grid">
@@ -153,7 +154,7 @@
             <label>Network display (seconds)<input id="setNetworkDisplay" type="number" min="1" max="30" step="0.1"></label>
           </div></details>
         </div>
-        <div class="settings-actions"><button id="saveSettings" type="submit" disabled>Save settings</button><button id="reloadSettings" class="secondary" type="button" disabled>Discard unsaved changes</button><span id="scannerControlMessage" class="notice">Loading scanner settings…</span></div>
+        <div class="settings-actions"><button id="saveSettings" type="submit" disabled>Save settings</button><button id="reloadSettings" class="secondary" type="button" disabled>Discard unsaved changes</button><button id="resetSettings" class="danger" type="button" disabled>Reset to defaults</button><span id="scannerControlMessage" class="notice">Loading scanner settings…</span></div>
       </form>
     </article>
     <article class="card image"><h2>Analysis alignment</h2><div id="imageEmpty" class="empty">The first completed scan will appear here.</div><img id="image" hidden alt="Latest analysis alignment frame"></article>
@@ -255,6 +256,7 @@ score = (35 × 0.2) + (15 × 0.5) = 14.5</div>
   let settingsLoaded = false;
   let settingsDirty = false;
   let pendingSettingsKey = '';
+  const default720BytesPerSecond = 70.73 * 1024 * 1024 / 600;
   const scannerSettingFields = {
     duration_seconds:['setDuration','number'], ir_enabled:['setIrEnabled','boolean'], camera_device:['setCameraDevice','string'],
     capture_width:['setCaptureWidth','number'], capture_height:['setCaptureHeight','number'], capture_fps:['setCaptureFps','number'], camera_buffers:['setCameraBuffers','number'], warmup_seconds:['setWarmup','number'], camera_lock:['setCameraLock','boolean'], fixed_framerate:['setFixedFramerate','boolean'],
@@ -268,6 +270,20 @@ score = (35 × 0.2) + (15 × 0.5) = 14.5</div>
     $('setVideoWidth').disabled=roiOnly;
     $('videoWidthNote').textContent=roiOnly ? 'Calculated automatically to preserve the ROI aspect ratio.' : 'Set directly for full-frame video.';
   }
+  function formatStorage(byteCount) {
+    const units=['B','MiB','GiB','TiB'];
+    let value=Number(byteCount), unit=units.shift();
+    if (value>=1024*1024) { value/=1024*1024; unit='MiB'; }
+    if (value>=1024) { value/=1024; unit='GiB'; }
+    if (value>=1024) { value/=1024; unit='TiB'; }
+    return `${value.toFixed(value<10 ? 2 : 1)} ${unit}`;
+  }
+  function updateStorageForecast() {
+    const duration=Math.max(0,Number($('setDuration').value)||0);
+    const sessions=Math.max(1,Number.parseInt($('setKeepCaptures').value,10)||1);
+    const perSession=default720BytesPerSecond*duration;
+    $('storageForecast').textContent=`Default 746×720 estimate: about ${formatStorage(perSession)} of video per session, or ${formatStorage(perSession*sessions)} for ${sessions} kept session${sessions===1?'':'s'}. Lower saved resolutions normally use less; motion and non-default encoding settings can change the result.`;
+  }
   function settingsKey(settings) { return JSON.stringify(settings,Object.keys(settings).sort()); }
   function populateScannerSettings(settings) {
     if (!settings) return;
@@ -278,7 +294,8 @@ score = (35 × 0.2) + (15 × 0.5) = 14.5</div>
     }
     settingsLoaded=true; settingsDirty=false; currentServerSettings={...settings};
     updateVideoRoiControls();
-    $('saveSettings').disabled=false; $('reloadSettings').disabled=false;
+    updateStorageForecast();
+    $('saveSettings').disabled=false; $('reloadSettings').disabled=false; $('resetSettings').disabled=false;
   }
   function readScannerSettings() {
     if (!$('scannerSettings').reportValidity()) throw new Error('Correct the highlighted setting first.');
@@ -396,8 +413,8 @@ score = (35 × 0.2) + (15 × 0.5) = 14.5</div>
     const rows = [...data.history].reverse().slice(0,20);
     $('history').innerHTML = rows.length ? rows.map(r => `<tr><td>${esc(String(r.video_path).split('/').pop())}</td><td>${esc(r.scan_timestamp)}</td><td>${esc(r.activity_score)}</td><td>${String(r.ir_enabled).toLowerCase()==='true'?'ON':'OFF'}</td><td>${esc(r.fps_estimate)}</td><td>${esc(r.brightness_mean)}</td><td>${esc(r.camera_locked_controls || '—')}</td></tr>`).join('') : '<tr><td colspan="7" class="muted">No scans recorded.</td></tr>';
   }
-  $('scannerSettings').addEventListener('input', () => { settingsDirty=true; });
-  $('scannerSettings').addEventListener('change', () => { settingsDirty=true; });
+  $('scannerSettings').addEventListener('input', () => { settingsDirty=true; updateStorageForecast(); });
+  $('scannerSettings').addEventListener('change', () => { settingsDirty=true; updateStorageForecast(); });
   $('setVideoRoiOnly').addEventListener('change', updateVideoRoiControls);
   $('scannerSettings').addEventListener('submit', async event => {
     event.preventDefault(); $('saveSettings').disabled=true; showScannerMessage('Saving settings…');
@@ -405,13 +422,23 @@ score = (35 × 0.2) + (15 × 0.5) = 14.5</div>
     finally { $('saveSettings').disabled=false; }
   });
   $('reloadSettings').addEventListener('click', () => { populateScannerSettings(currentServerSettings); pendingSettingsKey=''; showScannerMessage('Unsaved changes discarded.'); });
+  $('resetSettings').addEventListener('click', async () => {
+    if (!confirm('Reset all scanner settings to the deployment defaults?\n\nThe defaults will be saved and used for the next scan.')) return;
+    const button=$('resetSettings'); button.disabled=true; showScannerMessage('Resetting settings…');
+    try {
+      const data=await scannerRequest('/api/scanner/settings/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirm:true})});
+      pendingSettingsKey=settingsKey(data.settings); populateScannerSettings(data.settings); showScannerMessage(data.message);
+    } catch (error) { showScannerMessage(error.message,true); }
+    finally { button.disabled=false; }
+  });
   $('startScan').addEventListener('click', async () => {
     const button=$('startScan'); button.disabled=true;
     try {
-      const settings=await saveScannerSettings(false);
+      const settings=readScannerSettings();
       if (Number(settings.duration_seconds)===86400 && !confirm('Start a 24-hour session?\n\nThis creates 144 individually scored ten-minute recordings and runs slightly longer than 24 wall-clock hours.')) { button.disabled=false; return; }
-      showScannerMessage('Starting scan…');
-      const data=await scannerRequest('/api/scanner/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirm:true})});
+      showScannerMessage('Saving settings and starting scan…');
+      const data=await scannerRequest('/api/scanner/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirm:true,settings})});
+      pendingSettingsKey=settingsKey(data.settings); populateScannerSettings(data.settings);
       showScannerMessage(data.message);
     } catch (error) { showScannerMessage(error.message,true); button.disabled=false; }
   });

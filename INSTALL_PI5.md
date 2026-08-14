@@ -169,9 +169,10 @@ SECONDS`.
 Remove `--no-lcd` for an LCD test. A successful scan creates an MP4, first-frame
 JPEG, JSON, and CSV under `captures/`. Every successful scan is also appended to
 `captures/scan_history.csv`; this master history is not removed by capture
-cleanup. The MP4 retains the complete camera frame. The first-frame JPEG
-contains the exact analysis region so you can check specimen alignment and
-framing. Change its position with `--analysis-shift-x PERCENT`; negative values
+cleanup. By default, both the MP4 and first-frame JPEG contain the exact
+analysis region rather than the unused sides of the camera frame, so you can
+check specimen alignment and framing. Change its position with
+`--analysis-shift-x PERCENT`; negative values
 move left and positive values move right. Change only the extra left coverage
 with `--analysis-extend-left PERCENT`. Any resize set by `--analysis-width`
 calculates the height from the calibrated region instead of stretching it, so
@@ -232,6 +233,9 @@ systemctl status flyscanner.service
 The service starts at every boot and waits for the GPIO button. It runs without
 a graphical preview and restarts if startup fails. A failed individual scan is
 shown on the LCD/log and the process remains ready for another button press.
+Camera and preview resources are released on every error path, incomplete video
+and alignment files are removed, and a normal systemd stop exits successfully
+rather than appearing as a service failure.
 The separate network service performs privileged NetworkManager operations. The
 scanner reaches it through a local socket accessible only to root and the
 `flyscanner` group, so the camera service itself does not run as root.
@@ -255,8 +259,12 @@ state, so the LCD, dashboard, next capture, and rebooted service remain in sync.
 
 - **Save settings** queues validated changes; they apply as soon as the scanner
   is idle and are then written atomically to `flyscanner_state.json`.
-- **Save and start scan** first saves the visible settings, then queues a scan.
-  Starting the 24-hour preset requires an extra browser confirmation.
+- **Save and start scan** submits one combined command. The scanner writes and
+  applies the visible settings first and starts only if that succeeds, so the
+  scan cannot overtake a pending settings write. Starting the 24-hour preset
+  requires an extra browser confirmation.
+- **Reset to defaults** restores and saves the deployment defaults, including
+  intentional command-line defaults supplied by `/etc/default/flyscanner`.
 - **Stop current scan** requests a graceful stop. A partial video and score are
   retained if enough frames were captured; an extremely early stop may have no
   usable result.
@@ -267,6 +275,15 @@ state, so the LCD, dashboard, next capture, and rebooted service remain in sync.
 - **Save only the analysis ROI** is enabled by default. At saved height 720 the
   stored video is the native 746x720 input used by analysis; height 540 selects
   a smaller 560x540 playback copy without lowering analysis resolution.
+
+Retention is labelled **Total sessions kept** and includes the newest session.
+For example, 1 keeps only the newest session and 5 keeps the newest five. A
+complete 24-hour run counts as one session even though it contains 144 parts.
+The dashboard also shows a simple video-only forecast based on the measured
+default 746x720, grayscale H.264 CRF 21 profile: about 70.73 MiB per ten minutes
+or 9.95 GiB per 24-hour session. It multiplies that baseline by the selected
+runtime and retention count. Lower saved resolutions normally use less, while
+scene motion and non-default encoder settings can change the result.
 
 GPIO assignments, output paths, and the dashboard host/port remain in
 `/etc/default/flyscanner`. They are intentionally not live controls because a

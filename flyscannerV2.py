@@ -62,6 +62,10 @@ QR_CODE_FILES = {
 class ScanCancelled(Exception):
     """Raised when a remote stop request arrives before usable frames exist."""
 
+
+class ServiceStop(BaseException):
+    """Raised by SIGTERM so systemd shutdown is clean and cannot be swallowed."""
+
 RUNTIME_PRESETS_SECONDS = (30, 5 * 60, 10 * 60, 24 * 60 * 60)
 DEFAULT_RUNTIME_SECONDS = RUNTIME_PRESETS_SECONDS[0]
 DEFAULT_VIDEO_BYTES_PER_SECOND = 4_000_000
@@ -275,7 +279,7 @@ def parse_args() -> argparse.Namespace:
         "--keep-captures",
         type=int,
         default=5,
-        help="Number of most recent capture runs to keep. Use 0 to keep only the current run.",
+        help="Total number of newest capture sessions to keep, including the current session.",
     )
     parser.add_argument(
         "--motion-threshold",
@@ -734,7 +738,9 @@ def validate_scanner_settings(
         raise ValueError("video_preset must be ultrafast, superfast, or veryfast")
     settings["video_preset"] = preset
     settings["video_encoder_threads"] = integer("video_encoder_threads", 1, 4)
-    settings["keep_captures"] = integer("keep_captures", 0, 20)
+    # Older versions exposed 0 and 1 as two labels for the same behavior.
+    # Normalize an existing 0 to the unambiguous minimum of one session.
+    settings["keep_captures"] = max(1, integer("keep_captures", 0, 20))
     settings["result_hold_seconds"] = decimal("result_hold_seconds", 0, 30)
     settings["button_debounce_seconds"] = decimal(
         "button_debounce_seconds", 0, 2
@@ -1542,6 +1548,7 @@ def capture_video(
     dashboard: DashboardState | None = None,
     session_progress: str = "",
 ) -> tuple[float, int, ActivityResult]:
+    """Open the camera and guarantee its release after every exit path."""
     lcd.write("Opening camera", f"Cam {args.camera}")
     if dashboard is not None:
         dashboard.set_status("opening_camera", f"Camera {args.camera}")
@@ -1555,6 +1562,37 @@ def capture_video(
         args.fps,
         args.camera_buffers,
     )
+    try:
+        return capture_video_with_camera(
+            args,
+            video_path,
+            first_frame_path,
+            lcd,
+            scan_timestamp,
+            ir_enabled,
+            cap,
+            fixed_framerate,
+            dashboard,
+            session_progress,
+        )
+    finally:
+        cap.release()
+        if args.show_preview:
+            cv2.destroyAllWindows()
+
+
+def capture_video_with_camera(
+    args: argparse.Namespace,
+    video_path: Path,
+    first_frame_path: Path,
+    lcd: CharacterLcd | NullLcd,
+    scan_timestamp: str,
+    ir_enabled: bool,
+    cap: Any,
+    fixed_framerate: bool,
+    dashboard: DashboardState | None = None,
+    session_progress: str = "",
+) -> tuple[float, int, ActivityResult]:
 
     if args.warmup > 0:
         if dashboard is not None:
@@ -1564,7 +1602,6 @@ def capture_video(
         last_warmup_second = -1
         while time.monotonic() < warmup_end:
             if dashboard is not None and dashboard.cancel_requested():
-                cap.release()
                 raise ScanCancelled("Scan cancelled during camera warm-up")
             remaining = max(0, int(round(warmup_end - time.monotonic())))
             if remaining != last_warmup_second:
@@ -1586,12 +1623,10 @@ def capture_video(
             cap.read()
 
     if dashboard is not None and dashboard.cancel_requested():
-        cap.release()
         raise ScanCancelled("Scan cancelled before recording")
 
     ok, frame = cap.read()
     if not ok or frame is None:
-        cap.release()
         raise RuntimeError("Camera opened, but no frame could be read.")
 
     height, width = frame.shape[:2]
@@ -1731,10 +1766,9 @@ def capture_video(
                     break
     finally:
         capture_ended = time.monotonic()
+        # The outer capture_video() finally still releases the camera if FFmpeg
+        # raises while closing or finalizing its MP4 output.
         writer.release()
-        cap.release()
-        if args.show_preview:
-            cv2.destroyAllWindows()
 
     # Encoder finalization may take a moment and is not part of camera capture.
     actual_duration = max(capture_ended - start, 0.001)
@@ -2114,6 +2148,7 @@ class DashboardState:
         self._duration_seconds = DEFAULT_RUNTIME_SECONDS
         self._ir_available = True
         self._settings: dict[str, Any] = {}
+        self._default_settings: dict[str, Any] = {}
         self._commands: queue.Queue[dict[str, Any]] = queue.Queue()
         self._scan_active = False
         self._scan_queued = False
@@ -2156,10 +2191,19 @@ class DashboardState:
         with self._lock:
             return dict(self._settings)
 
+    def set_default_settings(self, settings: dict[str, Any]) -> None:
+        with self._lock:
+            self._default_settings = dict(settings)
+
+    def default_settings_snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return dict(self._default_settings)
+
     def request_settings(self, settings: dict[str, Any]) -> None:
         self._commands.put({"type": "settings", "settings": dict(settings)})
 
-    def request_scan(self) -> tuple[bool, str]:
+    def request_settings_and_scan(self, settings: dict[str, Any]) -> tuple[bool, str]:
+        """Queue one command so a scan cannot outrun settings persistence."""
         with self._lock:
             if self._scan_active:
                 return False, "A scan is already running"
@@ -2168,8 +2212,14 @@ class DashboardState:
             if self._status not in {"ready"}:
                 return False, f"Scanner is currently {self._status.replace('_', ' ')}"
             self._scan_queued = True
-        self._commands.put({"type": "scan"})
-        return True, "Scan queued"
+        self._commands.put(
+            {"type": "settings_and_scan", "settings": dict(settings)}
+        )
+        return True, "Settings and scan queued"
+
+    def reject_queued_scan(self) -> None:
+        with self._lock:
+            self._scan_queued = False
 
     def take_idle_command(self) -> dict[str, Any] | None:
         try:
@@ -2458,12 +2508,47 @@ class DashboardServer:
                 body = await request.json()
                 if not isinstance(body, dict) or body.get("confirm") is not True:
                     raise ValueError("Explicit confirmation is required")
+                payload = body.get("settings", self.state.settings_snapshot())
+                validated = validate_scanner_settings(
+                    payload, self.state.settings_snapshot()
+                )
+                if validated["ir_enabled"] and not self.state.ir_available():
+                    raise ValueError("IR control is disabled on this scanner")
             except (ValueError, TypeError, json.JSONDecodeError) as exc:
                 return web.json_response({"ok": False, "error": str(exc)}, status=400)
-            accepted, message = self.state.request_scan()
+            accepted, message = self.state.request_settings_and_scan(validated)
             return web.json_response(
-                {"ok": accepted, "message": message, "error": None if accepted else message},
+                {
+                    "ok": accepted,
+                    "message": message,
+                    "settings": validated,
+                    "error": None if accepted else message,
+                },
                 status=202 if accepted else 409,
+            )
+
+        async def scanner_settings_reset(request: Any) -> Any:
+            require_same_origin(request)
+            try:
+                body = await request.json()
+                if not isinstance(body, dict) or body.get("confirm") is not True:
+                    raise ValueError("Explicit confirmation is required")
+                defaults = validate_scanner_settings(
+                    self.state.default_settings_snapshot(),
+                    self.state.settings_snapshot(),
+                )
+                if not self.state.ir_available():
+                    defaults["ir_enabled"] = False
+                self.state.request_settings(defaults)
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                return web.json_response({"ok": False, "error": str(exc)}, status=400)
+            return web.json_response(
+                {
+                    "ok": True,
+                    "message": "Default settings queued and will apply when the scanner is idle",
+                    "settings": defaults,
+                },
+                status=202,
             )
 
         async def scanner_cancel(request: Any) -> Any:
@@ -2554,6 +2639,7 @@ class DashboardServer:
                 web.get("/scan_history.csv", history_csv),
                 web.get("/api/scanner/settings", scanner_settings_get),
                 web.put("/api/scanner/settings", scanner_settings_update),
+                web.post("/api/scanner/settings/reset", scanner_settings_reset),
                 web.post("/api/scanner/start", scanner_start),
                 web.post("/api/scanner/cancel", scanner_cancel),
                 web.get("/qr/{name}", qr_code),
@@ -2587,7 +2673,7 @@ def capture_stem_for(path: Path) -> str | None:
 
 
 def cleanup_old_captures(output_dir: Path, keep_captures: int, current_stem: str) -> int:
-    keep_captures = max(keep_captures, 0)
+    keep_captures = max(keep_captures, 1)
     runs: dict[str, list[Path]] = {}
 
     for path in output_dir.iterdir():
@@ -2598,8 +2684,7 @@ def cleanup_old_captures(output_dir: Path, keep_captures: int, current_stem: str
             runs.setdefault(stem, []).append(path)
 
     stems_newest_first = sorted(runs, reverse=True)
-    keep_count = max(keep_captures, 1)
-    stems_to_keep = set(stems_newest_first[:keep_count])
+    stems_to_keep = set(stems_newest_first[:keep_captures])
     stems_to_keep.add(current_stem)
 
     removed_count = 0
@@ -2658,16 +2743,24 @@ def run_scan_once(
     try:
         # IR is enabled before camera warm-up so auto-exposure settles under the
         # same lighting used for the recorded frames.
-        duration_seconds, frame_count, result = capture_video(
-            args,
-            video_path,
-            first_frame_path,
-            lcd,
-            scan_timestamp,
-            ir_enabled,
-            dashboard,
-            session_progress,
-        )
+        try:
+            duration_seconds, frame_count, result = capture_video(
+                args,
+                video_path,
+                first_frame_path,
+                lcd,
+                scan_timestamp,
+                ir_enabled,
+                dashboard,
+                session_progress,
+            )
+        except BaseException:
+            # A failed or interrupted recording has no matching metadata and is
+            # not useful through the dashboard. Do not leave a partial MP4/JPEG
+            # that looks like a completed scan.
+            video_path.unlink(missing_ok=True)
+            first_frame_path.unlink(missing_ok=True)
+            raise
     finally:
         illuminator.off()
         print("IR illuminator off")
@@ -2811,8 +2904,13 @@ def main() -> int:
         default_duration=DEFAULT_RUNTIME_SECONDS,
     )
     ir_enabled = False if args.no_ir else saved_ir_enabled
+    deployment_defaults = scanner_settings_from_args(
+        args, not args.no_ir, DEFAULT_RUNTIME_SECONDS
+    )
     if not args.run_now:
-        base_settings = scanner_settings_from_args(args, ir_enabled, saved_duration)
+        base_settings = dict(deployment_defaults)
+        base_settings["duration_seconds"] = saved_duration
+        base_settings["ir_enabled"] = ir_enabled
         scanner_settings = load_saved_web_settings(args.state_file, base_settings)
         scanner_settings["duration_seconds"] = saved_duration
         scanner_settings["ir_enabled"] = ir_enabled
@@ -2825,6 +2923,7 @@ def main() -> int:
     qr_dir = Path(__file__).resolve().parent / "qr-codes"
     dashboard_state = DashboardState(args.output_dir, history_path, qr_dir)
     dashboard_state.set_ir_available(not args.no_ir)
+    dashboard_state.set_default_settings(deployment_defaults)
     dashboard_state.set_settings(scanner_settings)
     dashboard_server: DashboardServer | None = None
 
@@ -2888,7 +2987,8 @@ def main() -> int:
                 hold_new_result = False
                 if isinstance(action, dict):
                     command_type = action.get("type")
-                    if command_type == "settings":
+                    if command_type in {"settings", "settings_and_scan"}:
+                        start_after_settings = command_type == "settings_and_scan"
                         try:
                             pending_settings = validate_scanner_settings(
                                 action.get("settings"),
@@ -2898,20 +2998,29 @@ def main() -> int:
                             )
                             if args.no_ir:
                                 pending_settings["ir_enabled"] = False
+                            # Persistence is the commit point. A combined web
+                            # command must never start if this write fails.
+                            save_full_scanner_settings(args.state_file, pending_settings)
                             apply_scanner_settings(args, pending_settings)
                             ir_enabled = bool(pending_settings["ir_enabled"])
-                            save_full_scanner_settings(args.state_file, pending_settings)
                             dashboard_state.set_settings(pending_settings)
                             lcd.write("Web settings", "Saved")
                             print("Applied and saved advanced web settings")
-                            time.sleep(0.6)
+                            if not start_after_settings:
+                                time.sleep(0.6)
                         except Exception as exc:
+                            if start_after_settings:
+                                dashboard_state.reject_queued_scan()
                             dashboard_state.set_status("settings_error", str(exc))
                             print(f"Could not apply web settings: {exc}", file=sys.stderr)
-                        continue
+                            continue
+                        if start_after_settings:
+                            action = "scan"
+                        else:
+                            continue
                     if command_type == "scan":
                         action = "scan"
-                    else:
+                    elif command_type not in {"settings", "settings_and_scan"}:
                         print(f"Ignoring unknown dashboard command: {command_type}", file=sys.stderr)
                         continue
                 if action == "show_network":
@@ -2982,11 +3091,14 @@ def main() -> int:
 
 if __name__ == "__main__":
     def stop_service(_signum: int, _frame: object) -> None:
-        raise KeyboardInterrupt
+        raise ServiceStop
 
     signal.signal(signal.SIGTERM, stop_service)
     try:
         raise SystemExit(main())
+    except ServiceStop:
+        print("\nStopped cleanly by systemd.", file=sys.stderr)
+        raise SystemExit(0)
     except KeyboardInterrupt:
         print("\nStopped by user.", file=sys.stderr)
         raise SystemExit(130)

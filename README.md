@@ -52,9 +52,11 @@ runtime; long-press again to advance to IR settings, then long-press once more
 to save both choices. The website provides the same runtime and IR choices plus
 advanced camera, analysis, compression, retention, and interface-timing
 settings. Choose **Save settings** to persist changes, or **Save and start
-scan** to persist them and queue a capture from the network. Runtime remains
-restricted to the same four physical-device presets. **Stop current scan**
-gracefully finalizes and scores a partial recording when enough frames exist.
+scan** to persist them and queue a capture as one ordered operation; a capture
+does not start if saving its settings fails. **Reset to defaults** restores the
+deployment defaults. Runtime remains restricted to the same four
+physical-device presets. **Stop current scan** gracefully finalizes and scores
+a partial recording when enough frames exist.
 
 Settings are applied between recordings and survive reboots. The dashboard can
 also download any requested number of the most recent completed videos (one by
@@ -70,6 +72,11 @@ Selecting 540 saved height produces a 560x540 ROI and measured about 2.79 GiB
 for 144 parts while analysis remains native resolution. Both matched tests
 sustained about 30.23 FPS with zero drops. The scanner adds 50% estimation
 headroom and preserves another 1 GiB before starting.
+
+The retention value is the total number of sessions kept, including the newest;
+a segmented 24-hour run counts as one session. The dashboard shows a simple
+storage forecast for the measured default 746x720 profile and selected
+retention count. Lower saved resolutions normally require less space.
 
 If no saved network is reachable, the Pi creates a unique password-protected
 setup hotspot. Connect to it and open `http://10.42.0.1:8080` to configure the
