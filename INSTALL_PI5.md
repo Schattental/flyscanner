@@ -27,7 +27,7 @@ camera interface on current Raspberry Pi OS.
 sudo apt update
 sudo apt full-upgrade -y
 sudo apt install -y python3-venv python3-dev python3-opencv python3-numpy \
-  python3-gpiozero python3-lgpio v4l-utils network-manager iw
+  python3-gpiozero python3-lgpio v4l-utils network-manager iw ffmpeg
 sudo usermod -aG video,gpio flyscanner
 ```
 
@@ -83,24 +83,78 @@ the array on before camera warm-up, keeps it on throughout capture, and switches
 it off immediately afterward, including when capture fails. Use `--ir-gpio
 NUMBER` to select a different free BCM GPIO or `--no-ir` to disable this feature.
 
-The idle LCD shows the saved IR capture state as `IR:on` or `IR:off`. The one
-button has the following behavior:
+The idle LCD shows both the saved runtime and IR capture state. The one button
+has the following behavior:
 
 - Single short press while idle: start a capture after a 0.6-second
-  double-press window, using the displayed IR setting.
+  double-press window, using the displayed runtime and IR setting.
 - Double press while idle: show the dashboard port and current LAN IP address
   on the LCD for eight seconds.
-- Long press while idle (1.5 seconds): open the IR setting screen.
-- Short press in the setting screen: toggle the selection between ON and OFF.
-- Long press in the setting screen: save the displayed selection and return.
+- Long press while idle (1.5 seconds): open capture settings at the runtime
+  screen.
+- Short press on the runtime screen: cycle through 30 seconds, 5 minutes,
+  10 minutes, and 24 hours.
+- Long press on the runtime screen: advance to IR settings.
+- Short press on the IR screen: toggle the selection between ON and OFF.
+- Long press on the IR screen: save both displayed settings and return.
 
-The confirmed choice is stored in `flyscanner_state.json` and loaded again after
-service restarts and reboots. The LEDs remain physically off while the scanner
-is idle even when the displayed capture setting is ON.
+The confirmed choices are stored in `flyscanner_state.json` and loaded again
+after service restarts and reboots. Existing state files containing only the IR
+choice are accepted and start with the new 30-second runtime. The LEDs remain
+physically off while the scanner is idle even when the displayed capture
+setting is ON.
+
+The 24-hour choice is stored as one session made of 144 independent 10-minute
+captures. Each part gets its own score, MP4, first-frame JPEG, JSON, and CSV row,
+just like 144 automatic button presses. Their shared timestamp and numbered
+names make the relationship obvious, for example:
+
+```text
+fly_activity_20260813_203000_session_part001.mp4
+fly_activity_20260813_203000_session_part001_activity.json
+...
+fly_activity_20260813_203000_session_part144.mp4
+```
+
+Capture cleanup counts the complete set as one session, not as 144 unrelated
+runs. There is a short camera warm-up and one-second score display between
+parts, so the session's wall-clock time is a few minutes longer than 24 hours.
+
+Capture and analysis remain at 1280x720/30 FPS, while the saved video is
+compressed live to 960x540 grayscale H.264 MP4 using `veryfast`, CRF 21, and two
+encoder threads. Testing the same real source produced these estimates:
+
+- 1280x720 color CRF 18: about 87 GB per 24 recorded hours
+- 1280x720 grayscale CRF 21: about 38 GB
+- 960x540 grayscale CRF 21: about 13 GB
+- 854x480 grayscale CRF 21: about 7.5 GB
+
+Grayscale alone saved only 6-8%; resolution and CRF produced most of the gain.
+The 960x540 choice retained good visual alignment/detail while leaving the
+full-resolution analysis unchanged. A subsequent live test captured and
+analyzed all 455 frames with zero drops, produced an exact 30 FPS stream, and
+used 1.46 MB over 15.17 seconds. That calmer scene projects to about 8.3 GB for
+24 recorded hours; the noisier benchmark projects about 13 GB, demonstrating
+why file size varies with content. Before opening the camera, the scanner
+estimates the total from recordings made with matching video settings, adds 50%
+headroom for scene variation, preserves another 1 GiB free, and refuses a
+session that would fill the drive. Ten-minute parts also limit the amount at
+risk if power is interrupted.
+
+Dashboard capture/analysis FPS uses camera processing time and excludes MP4
+finalization. Tiny deviations around 30 (for example 30.28) are normal camera
+buffer/timing effects; `ffprobe` confirmed the saved MP4 itself is exactly 30
+FPS. The first analysis frame is now correctly counted even though it serves as
+the motion baseline.
+
+Use `--video-codec mjpeg` only for the old large AVI format. H.264 output can be
+adjusted with `--video-width`, `--video-height`, `--video-crf`,
+`--video-preset`, and `--video-encoder-threads`. Use
+`--no-video-grayscale` when color is genuinely needed.
 
 Immediately after recording, the LCD switches directly to the activity score
 and holds it for six seconds. It then alternates every two seconds between the
-score and the `IR:on/off Tap/Hold` control hint. The button remains responsive
+score and the runtime/IR control hint. The button remains responsive
 during the initial score display. Change its duration with `--result-hold
 SECONDS`.
 
@@ -109,10 +163,10 @@ SECONDS`.
 .venv/bin/python flyscannerV2.py --run-now --no-lcd
 ```
 
-Remove `--no-lcd` for an LCD test. A successful scan creates an AVI, first-frame
+Remove `--no-lcd` for an LCD test. A successful scan creates an MP4, first-frame
 JPEG, JSON, and CSV under `captures/`. Every successful scan is also appended to
 `captures/scan_history.csv`; this master history is not removed by capture
-cleanup. The AVI retains the complete camera frame. The first-frame JPEG
+cleanup. The MP4 retains the complete camera frame. The first-frame JPEG
 contains the exact analysis region so you can check specimen alignment and
 framing. Change its position with `--analysis-shift-x PERCENT`; negative values
 move left and positive values move right. Change only the extra left coverage
@@ -182,9 +236,12 @@ scanner reaches it through a local socket accessible only to root and the
 ## 5. Open the local dashboard
 
 The service hosts a read-only dashboard on port 8080. It uses a WebSocket for
-live scanner status, result, IR state, temperature, disk space, and recent scan
-updates. It also provides the latest alignment image, latest video download, and
-the complete master history CSV.
+live scanner status, selected runtime, result, IR state, temperature, disk
+space, and recent scan updates. It also provides the latest alignment image,
+the complete master history CSV, and a video download control. Enter how many
+of the most recent completed recordings to download; the default is one (the
+latest). Multiple videos are streamed together as a `.tar` archive without
+creating a second large archive file on the Pi.
 
 Find the Pi's address:
 

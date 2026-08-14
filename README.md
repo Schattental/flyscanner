@@ -32,9 +32,9 @@ service.
 - `requirements-pi5.txt` — Python packages
 - `INSTALL_PI5.md` — fresh-device installation and wiring guide
 
-Videos, result files, the virtual environment, Python caches, and the local IR
-preference are intentionally excluded. They are generated independently on each
-scanner and should not make the source repository grow.
+Videos, result files, the virtual environment, Python caches, and the local
+runtime/IR preferences are intentionally excluded. They are generated
+independently on each scanner and should not make the source repository grow.
 
 ## Dashboard
 
@@ -46,6 +46,23 @@ http://flyscanner.local:8080
 
 Double-press the physical button to display the Pi's current numeric address on
 the LCD when `.local` hostname resolution is unavailable.
+
+Long-press the button to select a 30-second, 5-minute, 10-minute, or 24-hour
+runtime; long-press again to advance to IR settings, then long-press once more
+to save both choices. The dashboard shows the selected runtime and can download
+any requested number of the most recent completed videos (one by default).
+Multiple videos are delivered as a streaming `.tar` archive.
+
+The 24-hour choice creates 144 individually scored 10-minute H.264 MP4 parts.
+Every filename carries the same session timestamp plus `part001` through
+`part144`, and cleanup retains or removes the complete set as one session. A
+compression benchmark showed that 960x540 grayscale CRF 21 is a strong balance:
+about 13 GB per 24 recorded hours versus 38 GB for 720p grayscale CRF 21 and
+87 GB for the previous 720p color CRF 18 setting. Capture and analysis remain at
+full 1280x720/30 FPS; only the saved playback video is reduced. A live test used
+1.46 MB for 15.17 seconds (about 8.3 GB/day under that lighting), captured and
+analyzed all 455 frames, and dropped none. The scanner adds 50% estimation
+headroom and preserves another 1 GiB before starting.
 
 If no saved network is reachable, the Pi creates a unique password-protected
 setup hotspot. Connect to it and open `http://10.42.0.1:8080` to configure the

@@ -55,6 +55,15 @@ QR_CODE_FILES = {
     "3-open-network-dashboard.png",
 }
 
+RUNTIME_PRESETS_SECONDS = (30, 5 * 60, 10 * 60, 24 * 60 * 60)
+DEFAULT_RUNTIME_SECONDS = RUNTIME_PRESETS_SECONDS[0]
+DEFAULT_VIDEO_BYTES_PER_SECOND = 4_000_000
+DEFAULT_H264_BYTES_PER_SECOND = 180_000
+STORAGE_RESERVE_BYTES = 1024**3
+STORAGE_ESTIMATE_SAFETY_FACTOR = 1.5
+LONG_SESSION_SEGMENT_SECONDS = 10 * 60
+DASHBOARD_HISTORY_LIMIT = 1000
+
 
 @dataclass
 class ActivityResult:
@@ -62,6 +71,11 @@ class ActivityResult:
     video_path: str
     first_frame_path: str
     ir_enabled: bool
+    video_codec: str
+    video_width: int
+    video_height: int
+    video_grayscale: bool
+    video_crf: int | None
     capture_width: int
     capture_height: int
     analysis_roi_left: int
@@ -99,10 +113,57 @@ def parse_args() -> argparse.Namespace:
         default="/dev/video0",
         help="USB camera device (recommended: /dev/video0) or numeric OpenCV index.",
     )
-    parser.add_argument("--duration", type=float, default=15.0, help="Recording duration in seconds.")
+    parser.add_argument(
+        "--duration",
+        type=float,
+        default=float(DEFAULT_RUNTIME_SECONDS),
+        help="Recording duration in seconds for --run-now; button mode uses the saved preset.",
+    )
     parser.add_argument("--fps", type=float, default=30.0, help="Requested capture FPS.")
     parser.add_argument("--width", type=int, default=1280, help="Requested frame width.")
     parser.add_argument("--height", type=int, default=720, help="Requested frame height.")
+    parser.add_argument(
+        "--video-codec",
+        choices=("h264", "mjpeg"),
+        default="h264",
+        help="Video codec. H.264 MP4 is much smaller; MJPEG AVI is the legacy option.",
+    )
+    parser.add_argument(
+        "--video-crf",
+        type=int,
+        default=21,
+        help="H.264 quality from 0 (lossless/huge) to 51 (lowest); 21 is the tested default.",
+    )
+    parser.add_argument(
+        "--video-width",
+        type=int,
+        default=960,
+        help="Saved H.264 video width; capture and analysis remain at full resolution.",
+    )
+    parser.add_argument(
+        "--video-height",
+        type=int,
+        default=540,
+        help="Saved H.264 video height; capture and analysis remain at full resolution.",
+    )
+    parser.add_argument(
+        "--video-grayscale",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save grayscale H.264 video by default; use --no-video-grayscale for color.",
+    )
+    parser.add_argument(
+        "--video-preset",
+        choices=("ultrafast", "superfast", "veryfast"),
+        default="veryfast",
+        help="H.264 compression preset; veryfast is the tested Pi 5 default.",
+    )
+    parser.add_argument(
+        "--video-encoder-threads",
+        type=int,
+        default=2,
+        help="CPU threads reserved for live H.264 encoding.",
+    )
     parser.add_argument(
         "--camera-buffers",
         type=int,
@@ -217,7 +278,7 @@ def parse_args() -> argparse.Namespace:
         "--long-press",
         type=float,
         default=1.5,
-        help="Seconds the button must be held to open/confirm IR settings.",
+        help="Seconds the button must be held to advance/save capture settings.",
     )
     parser.add_argument(
         "--result-hold",
@@ -450,27 +511,74 @@ def test_button(button: ButtonInput, lcd: CharacterLcd | NullLcd, gpio_number: i
         time.sleep(0.05)
 
 
-def load_ir_capture_setting(state_file: Path, default: bool = True) -> bool:
+def runtime_label(duration_seconds: int) -> str:
+    labels = {
+        30: "30 seconds",
+        5 * 60: "5 minutes",
+        10 * 60: "10 minutes",
+        24 * 60 * 60: "24 hours",
+    }
+    return labels.get(duration_seconds, f"{duration_seconds} seconds")
+
+
+def runtime_lcd_label(duration_seconds: int) -> str:
+    labels = {30: "30 sec", 5 * 60: "5 min", 10 * 60: "10 min", 24 * 60 * 60: "24 hr"}
+    return labels.get(duration_seconds, f"{duration_seconds}s")
+
+
+def runtime_short_label(duration_seconds: int) -> str:
+    labels = {30: "30s", 5 * 60: "5m", 10 * 60: "10m", 24 * 60 * 60: "24h"}
+    return labels.get(duration_seconds, f"{duration_seconds}s")
+
+
+def preset_runtime(value: float | int) -> int:
+    numeric = float(value)
+    return min(RUNTIME_PRESETS_SECONDS, key=lambda candidate: abs(candidate - numeric))
+
+
+def load_scanner_settings(
+    state_file: Path,
+    default_ir: bool = True,
+    default_duration: int = DEFAULT_RUNTIME_SECONDS,
+) -> tuple[bool, int]:
     if not state_file.exists():
-        return default
+        return default_ir, preset_runtime(default_duration)
 
     try:
         with state_file.open("r", encoding="utf-8") as file:
-            value = json.load(file).get("ir_enabled")
-        if not isinstance(value, bool):
+            settings = json.load(file)
+        if not isinstance(settings, dict):
+            raise ValueError("settings must be an object")
+        ir_enabled = settings.get("ir_enabled", default_ir)
+        duration_seconds = settings.get("duration_seconds", default_duration)
+        if not isinstance(ir_enabled, bool):
             raise ValueError("ir_enabled must be true or false")
-        return value
+        if isinstance(duration_seconds, bool) or not isinstance(duration_seconds, (int, float)):
+            raise ValueError("duration_seconds must be a number")
+        duration_preset = int(duration_seconds)
+        if duration_preset not in RUNTIME_PRESETS_SECONDS:
+            raise ValueError("duration_seconds is not a supported preset")
+        return ir_enabled, duration_preset
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
-        print(f"Warning: could not read {state_file}: {exc}; using IR on", file=sys.stderr)
-        return default
+        print(
+            f"Warning: could not read {state_file}: {exc}; using default capture settings",
+            file=sys.stderr,
+        )
+        return default_ir, preset_runtime(default_duration)
 
 
-def save_ir_capture_setting(state_file: Path, enabled: bool) -> None:
+def save_scanner_settings(state_file: Path, ir_enabled: bool, duration_seconds: int) -> None:
+    if duration_seconds not in RUNTIME_PRESETS_SECONDS:
+        raise ValueError("duration_seconds is not a supported preset")
     state_file.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = state_file.with_name(f".{state_file.name}.tmp")
     try:
         with temporary_path.open("w", encoding="utf-8") as file:
-            json.dump({"ir_enabled": enabled}, file, indent=2)
+            json.dump(
+                {"ir_enabled": ir_enabled, "duration_seconds": duration_seconds},
+                file,
+                indent=2,
+            )
             file.write("\n")
         temporary_path.replace(state_file)
     except OSError:
@@ -488,6 +596,7 @@ def wait_for_idle_action(
     debounce_seconds: float,
     long_press_seconds: float,
     ir_enabled: bool,
+    duration_seconds: int,
     last_result: ActivityResult | None = None,
     hold_new_result: bool = False,
     result_hold_seconds: float = 6.0,
@@ -495,7 +604,8 @@ def wait_for_idle_action(
 ) -> str:
     print(
         f"Waiting for button on GPIO{gpio_number} "
-        f"(IR during capture: {'on' if ir_enabled else 'off'})..."
+        f"(runtime: {runtime_label(duration_seconds)}, "
+        f"IR during capture: {'on' if ir_enabled else 'off'})..."
     )
 
     while button.is_pressed:
@@ -524,7 +634,10 @@ def wait_for_idle_action(
                 lcd.write("Activity score", f"{last_result.activity_score:.2f}")
             else:
                 state = "on" if ir_enabled else "off"
-                lcd.write("Fly scanner", f"IR:{state} Tap/Hold")
+                lcd.write(
+                    "Fly scanner",
+                    f"{runtime_short_label(duration_seconds)} IR:{state} T/Hold",
+                )
             last_lcd_mode = mode
 
         time.sleep(0.05)
@@ -534,7 +647,7 @@ def wait_for_idle_action(
     while button.is_pressed:
         held_for = time.monotonic() - pressed_at
         if held_for >= long_press_seconds and not showed_long_press:
-            lcd.write("IR settings", "Release button")
+            lcd.write("Capture settings", "Release button")
             showed_long_press = True
         time.sleep(0.02)
 
@@ -542,7 +655,7 @@ def wait_for_idle_action(
     released_at = time.monotonic()
     if held_for >= long_press_seconds:
         time.sleep(debounce_seconds)
-        return "ir_settings"
+        return "capture_settings"
 
     # A single press is intentionally delayed by this short window. Ignore the
     # immediate release bounce, then look for one more distinct press.
@@ -604,20 +717,52 @@ def show_network_info(
     time.sleep(display_seconds)
 
 
-def configure_ir_capture(
+def configure_capture_settings(
     button: ButtonInput,
     lcd: CharacterLcd | NullLcd,
-    current_value: bool,
+    current_duration: int,
+    current_ir_value: bool,
     state_file: Path,
     debounce_seconds: float,
     long_press_seconds: float,
-) -> bool:
-    selected = current_value
-    print("IR settings: short press toggles; long press saves.")
+    ir_available: bool = True,
+) -> tuple[int, bool]:
+    selected_duration = preset_runtime(current_duration)
+    selected_ir = current_ir_value if ir_available else False
+    print("Capture settings: short press changes; long press advances, then saves.")
 
     while True:
-        state = "ON" if selected else "OFF"
-        lcd.write(f"IR capture: {state}", "Tap / hold save")
+        lcd.write(f"Runtime: {runtime_lcd_label(selected_duration)}", "Tap / hold next")
+
+        while not button.is_pressed:
+            time.sleep(0.05)
+
+        pressed_at = time.monotonic()
+        showed_next_prompt = False
+        while button.is_pressed:
+            held_for = time.monotonic() - pressed_at
+            if held_for >= long_press_seconds and not showed_next_prompt:
+                lcd.write("IR settings next", "Release button")
+                showed_next_prompt = True
+            time.sleep(0.02)
+
+        held_for = time.monotonic() - pressed_at
+        time.sleep(debounce_seconds)
+        if held_for >= long_press_seconds:
+            break
+
+        selected_index = RUNTIME_PRESETS_SECONDS.index(selected_duration)
+        selected_duration = RUNTIME_PRESETS_SECONDS[
+            (selected_index + 1) % len(RUNTIME_PRESETS_SECONDS)
+        ]
+        print(f"Runtime selection: {runtime_label(selected_duration)}")
+
+    while True:
+        state = "ON" if selected_ir else "OFF"
+        if ir_available:
+            lcd.write(f"IR capture: {state}", "Tap / hold save")
+        else:
+            lcd.write("IR unavailable", "Hold to save")
 
         while not button.is_pressed:
             time.sleep(0.05)
@@ -627,21 +772,24 @@ def configure_ir_capture(
         while button.is_pressed:
             held_for = time.monotonic() - pressed_at
             if held_for >= long_press_seconds and not showed_save_prompt:
-                lcd.write("Save IR setting", "Release to save")
+                lcd.write("Save settings", "Release to save")
                 showed_save_prompt = True
             time.sleep(0.02)
 
         held_for = time.monotonic() - pressed_at
         time.sleep(debounce_seconds)
         if held_for >= long_press_seconds:
-            save_ir_capture_setting(state_file, selected)
-            lcd.write("IR setting saved", f"Capture: {state}")
-            print(f"Saved IR capture setting: {state}")
+            save_scanner_settings(state_file, selected_ir, selected_duration)
+            lcd.write("Settings saved", f"{runtime_short_label(selected_duration)} IR:{state}")
+            print(
+                f"Saved capture settings: {runtime_label(selected_duration)}, IR {state}"
+            )
             time.sleep(1.0)
-            return selected
+            return selected_duration, selected_ir
 
-        selected = not selected
-        print(f"IR capture selection: {'ON' if selected else 'OFF'}")
+        if ir_available:
+            selected_ir = not selected_ir
+            print(f"IR capture selection: {'ON' if selected_ir else 'OFF'}")
 
 
 def add_local_venv_site_packages() -> None:
@@ -798,7 +946,114 @@ def lock_camera_controls(cap: cv2.VideoCapture, disabled: bool = False) -> dict[
     }
 
 
-def make_video_writer(path: Path, fps: float, frame_size: tuple[int, int]) -> cv2.VideoWriter:
+class FfmpegH264Writer:
+    def __init__(
+        self,
+        path: Path,
+        fps: float,
+        frame_size: tuple[int, int],
+        crf: int,
+        preset: str,
+        threads: int,
+        output_size: tuple[int, int],
+        grayscale: bool,
+    ) -> None:
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg is None:
+            raise RuntimeError("FFmpeg is missing; install it with: sudo apt install ffmpeg")
+        width, height = frame_size
+        output_width, output_height = output_size
+        filters = [f"scale={output_width}:{output_height}:flags=lanczos"]
+        if grayscale:
+            filters.append("hue=s=0")
+        command = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgr24",
+            "-video_size",
+            f"{width}x{height}",
+            "-framerate",
+            f"{fps:g}",
+            "-i",
+            "-",
+            "-an",
+            "-vf",
+            ",".join(filters),
+            "-c:v",
+            "libx264",
+            "-preset",
+            preset,
+            "-crf",
+            str(crf),
+            "-threads",
+            str(threads),
+            "-pix_fmt",
+            "yuv420p",
+            "-g",
+            str(max(1, round(fps * 10))),
+            "-movflags",
+            "+faststart",
+            str(path),
+        ]
+        self.process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+        self.path = path
+        self._released = False
+
+    def _error_text(self) -> str:
+        if self.process.stderr is None:
+            return "unknown FFmpeg error"
+        return self.process.stderr.read().decode(errors="replace").strip() or "unknown FFmpeg error"
+
+    def write(self, frame: np.ndarray) -> None:
+        if self._released or self.process.stdin is None:
+            raise RuntimeError("Cannot write to a closed H.264 video")
+        if self.process.poll() is not None:
+            raise RuntimeError(f"FFmpeg stopped while recording: {self._error_text()}")
+        try:
+            self.process.stdin.write(np.ascontiguousarray(frame).tobytes())
+        except BrokenPipeError as exc:
+            raise RuntimeError(f"FFmpeg stopped while recording: {self._error_text()}") from exc
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        if self.process.stdin is not None:
+            self.process.stdin.close()
+        return_code = self.process.wait()
+        if return_code:
+            raise RuntimeError(f"FFmpeg could not finalize {self.path.name}: {self._error_text()}")
+
+
+def make_video_writer(
+    args: argparse.Namespace,
+    path: Path,
+    fps: float,
+    frame_size: tuple[int, int],
+) -> Any:
+    if args.video_codec == "h264":
+        return FfmpegH264Writer(
+            path,
+            fps,
+            frame_size,
+            args.video_crf,
+            args.video_preset,
+            args.video_encoder_threads,
+            (args.video_width, args.video_height),
+            args.video_grayscale,
+        )
+
     codecs = ("MJPG", "XVID", "mp4v")
     for codec in codecs:
         writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*codec), fps, frame_size)
@@ -850,24 +1105,32 @@ class LiveActivityAnalyzer:
         self.dark_threshold = dark_threshold
         self.threshold_used = 0
         self.prev_gray: np.ndarray | None = None
-        self.motion_percentages: list[float] = []
-        self.fly_area_percentages: list[float] = []
-        self.moving_fly_area_percentages: list[float] = []
-        self.brightness_means: list[float] = []
-        self.brightness_mins: list[int] = []
-        self.brightness_maxs: list[int] = []
+        self.motion_count = 0
+        self.motion_sum = 0.0
+        self.motion_histogram = np.zeros(10_001, dtype=np.uint64)
+        self.fly_area_sum = 0.0
+        self.moving_fly_area_sum = 0.0
+        self.brightness_count = 0
+        self.brightness_sum = 0.0
+        self.brightness_min = 255
+        self.brightness_max = 0
         self.kernel = np.ones((3, 3), np.uint8)
 
     @property
     def frames_analyzed(self) -> int:
-        return len(self.motion_percentages)
+        # The first frame establishes the motion baseline but is still fully
+        # processed for brightness and thresholding, so include it in the
+        # displayed analysis throughput.
+        return self.brightness_count
 
     def update(self, frame: np.ndarray) -> None:
         gray_raw = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray_raw, (5, 5), 0)
-        self.brightness_means.append(float(gray_raw.mean()))
-        self.brightness_mins.append(int(gray_raw.min()))
-        self.brightness_maxs.append(int(gray_raw.max()))
+        brightness_mean = float(gray_raw.mean())
+        self.brightness_count += 1
+        self.brightness_sum += brightness_mean
+        self.brightness_min = min(self.brightness_min, int(gray_raw.min()))
+        self.brightness_max = max(self.brightness_max, int(gray_raw.max()))
 
         if self.prev_gray is None:
             self.prev_gray = gray
@@ -883,9 +1146,17 @@ class LiveActivityAnalyzer:
         moving_fly_mask = cv2.bitwise_and(motion_mask, fly_mask)
 
         total_pixels = float(gray.size)
-        self.motion_percentages.append(100.0 * cv2.countNonZero(motion_mask) / total_pixels)
-        self.fly_area_percentages.append(100.0 * cv2.countNonZero(fly_mask) / total_pixels)
-        self.moving_fly_area_percentages.append(100.0 * cv2.countNonZero(moving_fly_mask) / total_pixels)
+        motion_percent = 100.0 * cv2.countNonZero(motion_mask) / total_pixels
+        fly_area_percent = 100.0 * cv2.countNonZero(fly_mask) / total_pixels
+        moving_fly_area_percent = (
+            100.0 * cv2.countNonZero(moving_fly_mask) / total_pixels
+        )
+        self.motion_count += 1
+        self.motion_sum += motion_percent
+        histogram_index = min(10_000, max(0, round(motion_percent * 100.0)))
+        self.motion_histogram[histogram_index] += 1
+        self.fly_area_sum += fly_area_percent
+        self.moving_fly_area_sum += moving_fly_area_percent
 
         self.prev_gray = gray
 
@@ -897,13 +1168,20 @@ class LiveActivityAnalyzer:
         frames_captured: int,
         metadata: dict[str, Any],
     ) -> ActivityResult:
-        if self.frames_analyzed == 0:
+        if self.motion_count == 0:
             raise RuntimeError("Not enough frames were captured to analyze activity.")
 
-        motion_mean = float(np.mean(self.motion_percentages))
-        motion_peak = float(np.percentile(self.motion_percentages, 95))
-        fly_area_mean = float(np.mean(self.fly_area_percentages))
-        moving_fly_area_mean = float(np.mean(self.moving_fly_area_percentages))
+        motion_mean = self.motion_sum / self.motion_count
+        percentile_position = (self.motion_count - 1) * 0.95
+        lower_index = int(percentile_position)
+        upper_index = min(lower_index + 1, self.motion_count - 1)
+        fraction = percentile_position - lower_index
+        cumulative_motion = np.cumsum(self.motion_histogram)
+        lower_value = np.searchsorted(cumulative_motion, lower_index + 1) / 100.0
+        upper_value = np.searchsorted(cumulative_motion, upper_index + 1) / 100.0
+        motion_peak = float(lower_value + (upper_value - lower_value) * fraction)
+        fly_area_mean = self.fly_area_sum / self.motion_count
+        moving_fly_area_mean = self.moving_fly_area_sum / self.motion_count
         raw_score = (0.7 * moving_fly_area_mean + 0.3 * motion_mean) / 2.0 * 100.0
         # This is an activity index, not a percentage. Do not clamp it to 100:
         # highly active samples must remain distinguishable from one another.
@@ -914,6 +1192,11 @@ class LiveActivityAnalyzer:
             video_path=str(video_path),
             first_frame_path=str(first_frame_path),
             ir_enabled=metadata["ir_enabled"],
+            video_codec=metadata["video_codec"],
+            video_width=metadata["video_width"],
+            video_height=metadata["video_height"],
+            video_grayscale=metadata["video_grayscale"],
+            video_crf=metadata["video_crf"],
             capture_width=metadata["capture_width"],
             capture_height=metadata["capture_height"],
             analysis_roi_left=metadata["analysis_roi_left"],
@@ -932,9 +1215,9 @@ class LiveActivityAnalyzer:
             fps_estimate=round(frames_captured / max(duration_seconds, 0.001), 3),
             analysis_fps_estimate=round(self.frames_analyzed / max(duration_seconds, 0.001), 3),
             activity_score=round(activity_score, 2),
-            brightness_mean=round(float(np.mean(self.brightness_means)), 2),
-            brightness_min=min(self.brightness_mins),
-            brightness_max=max(self.brightness_maxs),
+            brightness_mean=round(self.brightness_sum / max(self.brightness_count, 1), 2),
+            brightness_min=self.brightness_min,
+            brightness_max=self.brightness_max,
             motion_percent_mean=round(motion_mean, 4),
             motion_percent_peak=round(motion_peak, 4),
             fly_area_percent_mean=round(fly_area_mean, 4),
@@ -951,6 +1234,7 @@ def capture_video(
     scan_timestamp: str,
     ir_enabled: bool,
     dashboard: DashboardState | None = None,
+    session_progress: str = "",
 ) -> tuple[float, int, ActivityResult]:
     lcd.write("Opening camera", f"Cam {args.camera}")
     if dashboard is not None:
@@ -1028,16 +1312,20 @@ def capture_video(
         f"(0=black, 255=white)"
     )
 
-    writer = make_video_writer(video_path, negotiated_fps, (width, height))
+    writer = make_video_writer(args, video_path, negotiated_fps, (width, height))
     analyzer = LiveActivityAnalyzer(args.motion_threshold, args.min_change_area, args.dark_threshold)
 
     start = time.monotonic()
     frame_count = 0
     dropped_frames = 0
-    last_status_second = -1
-    lcd.write("Recording", f"0/{int(args.duration)} sec")
+    progress_interval = 60 if args.duration >= 60 * 60 else 1
+    last_progress_bucket = -1
+    duration_display = format_recording_time(args.duration)
+    recording_title = session_progress or "Recording"
+    lcd.write(recording_title, f"00:00/{duration_display}"[-16:])
     if dashboard is not None:
-        dashboard.set_status("recording", f"0/{args.duration:g} seconds")
+        detail_prefix = f"{session_progress} · " if session_progress else ""
+        dashboard.set_status("recording", f"{detail_prefix}00:00 / {duration_display}")
 
     try:
         while True:
@@ -1069,33 +1357,46 @@ def capture_video(
                     )
                 analyzer.update(analysis_frame)
 
-            status_second = int(elapsed)
-            if status_second != last_status_second:
-                print(f"  capture progress: {status_second}/{int(args.duration)}s, {frame_count} frames")
-                lcd.write("Recording", f"{status_second}/{int(args.duration)} sec")
+            progress_bucket = int(elapsed // progress_interval)
+            if progress_bucket != last_progress_bucket:
+                elapsed_display = format_recording_time(elapsed)
+                print(
+                    f"  capture progress: {elapsed_display}/{duration_display}, "
+                    f"{frame_count} frames"
+                )
+                lcd.write(recording_title, f"{elapsed_display}/{duration_display}"[-16:])
                 if dashboard is not None:
+                    detail_prefix = f"{session_progress} · " if session_progress else ""
                     dashboard.set_status(
-                        "recording", f"{status_second}/{int(args.duration)} seconds"
+                        "recording",
+                        f"{detail_prefix}{elapsed_display} / {duration_display}",
                     )
-                last_status_second = status_second
+                last_progress_bucket = progress_bucket
 
             if args.show_preview:
                 cv2.imshow("Fruit fly activity capture", frame)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
     finally:
+        capture_ended = time.monotonic()
         writer.release()
         cap.release()
         if args.show_preview:
             cv2.destroyAllWindows()
 
-    actual_duration = max(time.monotonic() - start, 0.001)
+    # Encoder finalization may take a moment and is not part of camera capture.
+    actual_duration = max(capture_ended - start, 0.001)
     if frame_count < 2:
         raise RuntimeError("Not enough frames were captured to analyze activity.")
 
     metadata: dict[str, Any] = {
         "scan_timestamp": scan_timestamp,
         "ir_enabled": ir_enabled,
+        "video_codec": args.video_codec,
+        "video_width": args.video_width if args.video_codec == "h264" else width,
+        "video_height": args.video_height if args.video_codec == "h264" else height,
+        "video_grayscale": args.video_grayscale if args.video_codec == "h264" else False,
+        "video_crf": args.video_crf if args.video_codec == "h264" else None,
         "capture_width": width,
         "capture_height": height,
         "analysis_roi_left": crop_left,
@@ -1146,9 +1447,29 @@ def save_results(result: ActivityResult, output_dir: Path, stem: str) -> None:
 
 
 def append_scan_history(result: ActivityResult, history_path: Path) -> None:
-    """Append one durable summary row without rewriting previous scans."""
+    """Append one durable row, safely expanding an older history schema."""
     row = asdict(result)
     needs_header = not history_path.exists() or history_path.stat().st_size == 0
+    if not needs_header:
+        try:
+            with history_path.open("r", newline="", encoding="utf-8") as file:
+                reader = csv.DictReader(file)
+                old_fieldnames = reader.fieldnames or []
+                old_rows = list(reader)
+            new_fieldnames = list(row.keys())
+            if old_fieldnames != new_fieldnames:
+                temporary_path = history_path.with_name(f".{history_path.name}.tmp")
+                try:
+                    with temporary_path.open("w", newline="", encoding="utf-8") as file:
+                        writer = csv.DictWriter(file, fieldnames=new_fieldnames)
+                        writer.writeheader()
+                        writer.writerows(old_rows)
+                    temporary_path.replace(history_path)
+                finally:
+                    temporary_path.unlink(missing_ok=True)
+        except (OSError, csv.Error) as exc:
+            raise RuntimeError(f"Could not update scan history schema: {exc}") from exc
+
     with history_path.open("a", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=list(row.keys()))
         if needs_header:
@@ -1157,7 +1478,9 @@ def append_scan_history(result: ActivityResult, history_path: Path) -> None:
         file.flush()
 
 
-def load_recent_history(history_path: Path, limit: int = 20) -> list[dict[str, str]]:
+def load_recent_history(
+    history_path: Path, limit: int = DASHBOARD_HISTORY_LIMIT
+) -> list[dict[str, str]]:
     if not history_path.exists():
         return []
     try:
@@ -1166,6 +1489,119 @@ def load_recent_history(history_path: Path, limit: int = 20) -> list[dict[str, s
     except (OSError, csv.Error) as exc:
         print(f"Warning: could not load scan history: {exc}", file=sys.stderr)
         return []
+
+
+def format_recording_time(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def human_file_size(byte_count: float) -> str:
+    value = float(byte_count)
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    for unit in units:
+        if value < 1024.0 or unit == units[-1]:
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024.0
+    return f"{value:.1f} TiB"
+
+
+def video_extension(video_codec: str) -> str:
+    return ".mp4" if video_codec == "h264" else ".avi"
+
+
+def estimated_video_bytes_per_second(
+    output_dir: Path,
+    width: int,
+    height: int,
+    fps: float,
+    video_codec: str,
+    video_width: int,
+    video_height: int,
+    video_grayscale: bool,
+    video_crf: int,
+) -> float:
+    measured_rates: list[float] = []
+    for metadata_path in sorted(output_dir.glob("fly_activity_*_activity.json"))[-10:]:
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            video_path = Path(str(metadata["video_path"]))
+            if not video_path.is_absolute():
+                video_path = output_dir / video_path.name
+            if video_path.suffix.lower() != video_extension(video_codec):
+                continue
+            if video_codec == "h264" and (
+                int(metadata.get("video_width", 0)) != video_width
+                or int(metadata.get("video_height", 0)) != video_height
+                or bool(metadata.get("video_grayscale", False)) != video_grayscale
+                or int(metadata.get("video_crf", -1)) != video_crf
+            ):
+                continue
+            duration = float(metadata["duration_seconds"])
+            size = video_path.stat().st_size
+            if duration > 0 and size > 0:
+                recorded_width = max(1, int(metadata.get("capture_width", width)))
+                recorded_height = max(1, int(metadata.get("capture_height", height)))
+                recorded_fps = max(1.0, float(metadata.get("fps_estimate", fps)))
+                if video_codec == "h264":
+                    scale = fps / recorded_fps
+                else:
+                    scale = (width * height * fps) / (
+                        recorded_width * recorded_height * recorded_fps
+                    )
+                measured_rates.append(size / duration * scale)
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+
+    if measured_rates:
+        measured_rates.sort()
+        return measured_rates[len(measured_rates) // 2]
+
+    resolution_scale = (width * height) / float(1280 * 720)
+    fps_scale = fps / 30.0
+    if video_codec == "h264":
+        stored_resolution_scale = (video_width * video_height) / float(960 * 540)
+        quality_scale = 2.0 ** ((21 - video_crf) / 6.0)
+        color_scale = 1.08 if not video_grayscale else 1.0
+        base_rate = (
+            DEFAULT_H264_BYTES_PER_SECOND
+            * stored_resolution_scale
+            * quality_scale
+            * color_scale
+        )
+        resolution_scale = 1.0
+    else:
+        base_rate = DEFAULT_VIDEO_BYTES_PER_SECOND
+    return base_rate * resolution_scale * fps_scale
+
+
+def ensure_capture_storage(args: argparse.Namespace) -> tuple[int, int]:
+    bytes_per_second = estimated_video_bytes_per_second(
+        args.output_dir,
+        args.width,
+        args.height,
+        args.fps,
+        args.video_codec,
+        args.video_width,
+        args.video_height,
+        args.video_grayscale,
+        args.video_crf,
+    )
+    estimated_bytes = int(bytes_per_second * args.duration)
+    free_bytes = shutil.disk_usage(args.output_dir).free
+    required_bytes = (
+        int(estimated_bytes * STORAGE_ESTIMATE_SAFETY_FACTOR) + STORAGE_RESERVE_BYTES
+    )
+    if required_bytes > free_bytes:
+        raise RuntimeError(
+            f"{runtime_label(int(args.duration))} needs about "
+            f"{human_file_size(estimated_bytes)}; only {human_file_size(free_bytes)} free"
+        )
+    return estimated_bytes, free_bytes
 
 
 def system_health(output_dir: Path) -> dict[str, float | None]:
@@ -1307,8 +1743,9 @@ class DashboardState:
         self._status = "starting"
         self._detail = "Initializing scanner"
         self._ir_enabled = False
+        self._duration_seconds = DEFAULT_RUNTIME_SECONDS
         self._history: deque[dict[str, Any]] = deque(
-            load_recent_history(history_path), maxlen=20
+            load_recent_history(history_path), maxlen=DASHBOARD_HISTORY_LIMIT
         )
         self._latest_result: dict[str, Any] | None = (
             dict(self._history[-1]) if self._history else None
@@ -1322,6 +1759,10 @@ class DashboardState:
     def set_ir_enabled(self, enabled: bool) -> None:
         with self._lock:
             self._ir_enabled = enabled
+
+    def set_duration(self, duration_seconds: int) -> None:
+        with self._lock:
+            self._duration_seconds = duration_seconds
 
     def publish_result(self, result: ActivityResult) -> None:
         row = asdict(result)
@@ -1339,16 +1780,39 @@ class DashboardState:
             return None
         return path
 
+    def recent_video_paths(self, limit: int | None = None) -> list[Path]:
+        with self._lock:
+            history = [dict(row) for row in self._history]
+        paths: list[Path] = []
+        seen: set[Path] = set()
+        for row in reversed(history):
+            value = row.get("video_path")
+            path = Path(str(value)).resolve() if value else None
+            if (
+                path is None
+                or path in seen
+                or not path.is_file()
+                or self.output_dir not in path.parents
+            ):
+                continue
+            paths.append(path)
+            seen.add(path)
+            if limit is not None and len(paths) >= limit:
+                break
+        return paths
+
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             payload: dict[str, Any] = {
                 "status": self._status,
                 "detail": self._detail,
                 "ir_enabled": self._ir_enabled,
+                "duration_seconds": self._duration_seconds,
                 "latest_result": dict(self._latest_result) if self._latest_result else None,
-                "history": [dict(row) for row in self._history],
+                "history": [dict(row) for row in list(self._history)[-20:]],
             }
         payload["latest_image_available"] = self.latest_image_path() is not None
+        payload["available_videos"] = len(self.recent_video_paths())
         payload["health"] = system_health(self.output_dir)
         payload["server_time"] = datetime.now().isoformat(timespec="seconds")
         return payload
@@ -1445,6 +1909,61 @@ class DashboardServer:
                 raise web.HTTPNotFound()
             return web.FileResponse(path)
 
+        async def download_videos(request: Any) -> Any:
+            try:
+                count = int(request.query.get("count", "1"))
+            except ValueError as exc:
+                raise web.HTTPBadRequest(text="count must be a whole number") from exc
+            if not 1 <= count <= DASHBOARD_HISTORY_LIMIT:
+                raise web.HTTPBadRequest(
+                    text=f"count must be between 1 and {DASHBOARD_HISTORY_LIMIT}"
+                )
+
+            paths = self.state.recent_video_paths(count)
+            if not paths:
+                raise web.HTTPNotFound(text="No completed videos are available")
+            if len(paths) == 1:
+                return web.FileResponse(
+                    paths[0],
+                    headers={
+                        "Content-Disposition": f'attachment; filename="{paths[0].name}"'
+                    },
+                )
+
+            archive_name = f"flyscanner-last-{len(paths)}-videos.tar"
+            process = await asyncio.create_subprocess_exec(
+                "tar",
+                "-cf",
+                "-",
+                "-C",
+                str(self.state.output_dir),
+                *(path.name for path in paths),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            response = web.StreamResponse(
+                headers={
+                    "Content-Type": "application/x-tar",
+                    "Content-Disposition": f'attachment; filename="{archive_name}"',
+                }
+            )
+            await response.prepare(request)
+            try:
+                assert process.stdout is not None
+                while chunk := await process.stdout.read(1024 * 1024):
+                    await response.write(chunk)
+                return_code = await process.wait()
+                if return_code:
+                    assert process.stderr is not None
+                    error = (await process.stderr.read()).decode(errors="replace").strip()
+                    print(f"Video archive failed: {error}", file=sys.stderr)
+                await response.write_eof()
+            except (ConnectionResetError, asyncio.CancelledError):
+                if process.returncode is None:
+                    process.terminate()
+                    await process.wait()
+            return response
+
         async def history_csv(_request: Any) -> Any:
             if not self.state.history_path.is_file():
                 raise web.HTTPNotFound(text="No scan history is available yet")
@@ -1520,6 +2039,7 @@ class DashboardServer:
                 web.get("/ws", websocket),
                 web.get("/latest-image", latest_image),
                 web.get("/captures/{name}", capture_file),
+                web.get("/download-videos", download_videos),
                 web.get("/scan_history.csv", history_csv),
                 web.get("/qr/{name}", qr_code),
                 web.get("/api/network/status", network_status),
@@ -1541,10 +2061,14 @@ class DashboardServer:
 
 
 def capture_stem_for(path: Path) -> str | None:
-    match = re.match(r"^(fly_activity_\d{8}_\d{6})(?:_activity|_first_frame)?\.(?:avi|json|csv|jpg)$", path.name)
+    match = re.match(
+        r"^(fly_activity_\d{8}_\d{6})(?:(?P<session>_session)_part\d{3})?"
+        r"(?:_activity|_first_frame)?\.(?:avi|mp4|json|csv|jpg)$",
+        path.name,
+    )
     if not match:
         return None
-    return match.group(1)
+    return match.group(1) + (match.group("session") or "")
 
 
 def cleanup_old_captures(output_dir: Path, keep_captures: int, current_stem: str) -> int:
@@ -1583,14 +2107,23 @@ def run_scan_once(
     illuminator: IrIlluminator | NullIlluminator,
     ir_enabled: bool,
     dashboard: DashboardState | None = None,
+    filename_stem: str | None = None,
+    session_progress: str = "",
+    check_storage: bool = True,
 ) -> ActivityResult:
     ensure_cv_deps()
+    if check_storage:
+        estimated_bytes, free_bytes = ensure_capture_storage(args)
+        print(
+            f"Estimated video size: {human_file_size(estimated_bytes)} "
+            f"({human_file_size(free_bytes)} free before capture)"
+        )
 
     scan_started = datetime.now()
     timestamp = scan_started.strftime("%Y%m%d_%H%M%S")
     scan_timestamp = scan_started.isoformat(timespec="seconds")
-    stem = f"fly_activity_{timestamp}"
-    video_path = args.output_dir / f"{stem}.avi"
+    stem = filename_stem or f"fly_activity_{timestamp}"
+    video_path = args.output_dir / f"{stem}{video_extension(args.video_codec)}"
     first_frame_path = args.output_dir / f"{stem}_first_frame.jpg"
 
     print(
@@ -1598,7 +2131,10 @@ def run_scan_once(
         f"at {args.width}x{args.height}, {args.fps:g} FPS..."
     )
     if dashboard is not None:
-        dashboard.set_status("starting_scan", f"IR {'on' if ir_enabled else 'off'}")
+        detail = f"IR {'on' if ir_enabled else 'off'}"
+        if session_progress:
+            detail = f"{session_progress} · {detail}"
+        dashboard.set_status("starting_scan", detail)
     if ir_enabled:
         print(f"Turning IR illuminator on (GPIO{args.ir_gpio})...")
         illuminator.on()
@@ -1615,6 +2151,7 @@ def run_scan_once(
             scan_timestamp,
             ir_enabled,
             dashboard,
+            session_progress,
         )
     finally:
         illuminator.off()
@@ -1626,7 +2163,12 @@ def run_scan_once(
     print("Saving activity results...")
     save_results(result, args.output_dir, stem)
     append_scan_history(result, args.output_dir / "scan_history.csv")
-    removed_count = cleanup_old_captures(args.output_dir, args.keep_captures, stem)
+    current_group = capture_stem_for(video_path)
+    if current_group is None:
+        raise RuntimeError(f"Could not determine capture group for {video_path.name}")
+    removed_count = cleanup_old_captures(
+        args.output_dir, args.keep_captures, current_group
+    )
     if removed_count:
         print(f"Cleaned up {removed_count} old capture files.")
 
@@ -1637,6 +2179,58 @@ def run_scan_once(
     return result
 
 
+def run_selected_scan(
+    args: argparse.Namespace,
+    lcd: CharacterLcd | NullLcd,
+    illuminator: IrIlluminator | NullIlluminator,
+    ir_enabled: bool,
+    dashboard: DashboardState | None = None,
+) -> ActivityResult:
+    if int(args.duration) != 24 * 60 * 60:
+        return run_scan_once(args, lcd, illuminator, ir_enabled, dashboard)
+
+    estimated_bytes, free_bytes = ensure_capture_storage(args)
+    print(
+        f"Starting 24-hour segmented session; estimated total video size "
+        f"{human_file_size(estimated_bytes)} ({human_file_size(free_bytes)} free)"
+    )
+    session_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    session_stem = f"fly_activity_{session_timestamp}_session"
+    total_parts = (24 * 60 * 60) // LONG_SESSION_SEGMENT_SECONDS
+    original_duration = args.duration
+    latest_result: ActivityResult | None = None
+    try:
+        args.duration = float(LONG_SESSION_SEGMENT_SECONDS)
+        for part_number in range(1, total_parts + 1):
+            progress = f"Part {part_number:03d}/{total_parts:03d}"
+            part_stem = f"{session_stem}_part{part_number:03d}"
+            print(f"24-hour session {progress}: {part_stem}")
+            latest_result = run_scan_once(
+                args,
+                lcd,
+                illuminator,
+                ir_enabled,
+                dashboard,
+                filename_stem=part_stem,
+                session_progress=progress,
+                check_storage=False,
+            )
+            if part_number < total_parts:
+                lcd.write(f"Part {part_number:03d} score", f"{latest_result.activity_score:.2f}")
+                if dashboard is not None:
+                    dashboard.set_status(
+                        "session_segment_complete",
+                        f"{progress} score {latest_result.activity_score:.2f}",
+                    )
+                time.sleep(1.0)
+    finally:
+        args.duration = original_duration
+
+    if latest_result is None:
+        raise RuntimeError("The 24-hour session did not record any segments")
+    return latest_result
+
+
 def main() -> int:
     args = parse_args()
     if (
@@ -1644,11 +2238,21 @@ def main() -> int:
         or args.fps <= 0
         or args.width <= 0
         or args.height <= 0
+        or args.video_width <= 0
+        or args.video_height <= 0
         or args.camera_buffers <= 0
+        or args.video_encoder_threads <= 0
     ):
         raise ValueError(
-            "duration, fps, width, height and camera-buffers must all be greater than zero"
+            "duration, fps, capture/video dimensions, camera-buffers and encoder threads "
+            "must all be greater than zero"
         )
+    if args.video_codec == "h264" and (
+        args.video_width % 2 or args.video_height % 2
+    ):
+        raise ValueError("H.264 video width and height must be even numbers")
+    if not 0 <= args.video_crf <= 51:
+        raise ValueError("video-crf must be between 0 and 51")
     if args.analysis_width < 0 or args.analyze_every <= 0 or args.opencv_threads <= 0:
         raise ValueError("analysis-width cannot be negative; analyze-every and threads must be positive")
     if not -100.0 <= args.analysis_shift_x <= 100.0:
@@ -1683,11 +2287,19 @@ def main() -> int:
     cv2.setNumThreads(max(args.opencv_threads, 1))
     lcd = setup_lcd(args)
     illuminator = setup_illuminator(args)
-    ir_enabled = False if args.no_ir else load_ir_capture_setting(args.state_file)
+    saved_ir_enabled, saved_duration = load_scanner_settings(
+        args.state_file,
+        default_ir=not args.no_ir,
+        default_duration=DEFAULT_RUNTIME_SECONDS,
+    )
+    ir_enabled = False if args.no_ir else saved_ir_enabled
+    if not args.run_now:
+        args.duration = float(saved_duration)
     history_path = args.output_dir / "scan_history.csv"
     qr_dir = Path(__file__).resolve().parent / "qr-codes"
     dashboard_state = DashboardState(args.output_dir, history_path, qr_dir)
     dashboard_state.set_ir_enabled(ir_enabled)
+    dashboard_state.set_duration(int(args.duration))
     dashboard_server: DashboardServer | None = None
 
     try:
@@ -1720,7 +2332,7 @@ def main() -> int:
             dashboard_server.start()
 
         if args.run_now:
-            run_scan_once(args, lcd, illuminator, ir_enabled, dashboard_state)
+            run_selected_scan(args, lcd, illuminator, ir_enabled, dashboard_state)
             return 0
 
         button = setup_button(args)
@@ -1740,6 +2352,7 @@ def main() -> int:
                     args.button_debounce,
                     args.long_press,
                     ir_enabled,
+                    int(args.duration),
                     last_result,
                     hold_new_result,
                     args.result_hold,
@@ -1755,25 +2368,25 @@ def main() -> int:
                         args.network_socket,
                     )
                     continue
-                if action == "ir_settings":
-                    dashboard_state.set_status("ir_settings", "Waiting for selection")
-                    if args.no_ir:
-                        lcd.write("IR unavailable", "--no-ir active")
-                        time.sleep(1.5)
-                    else:
-                        ir_enabled = configure_ir_capture(
-                            button,
-                            lcd,
-                            ir_enabled,
-                            args.state_file,
-                            args.button_debounce,
-                            args.long_press,
-                        )
-                        dashboard_state.set_ir_enabled(ir_enabled)
+                if action == "capture_settings":
+                    dashboard_state.set_status("capture_settings", "Selecting runtime and IR")
+                    selected_duration, ir_enabled = configure_capture_settings(
+                        button,
+                        lcd,
+                        int(args.duration),
+                        ir_enabled,
+                        args.state_file,
+                        args.button_debounce,
+                        args.long_press,
+                        ir_available=not args.no_ir,
+                    )
+                    args.duration = float(selected_duration)
+                    dashboard_state.set_duration(selected_duration)
+                    dashboard_state.set_ir_enabled(ir_enabled)
                     continue
 
                 try:
-                    last_result = run_scan_once(
+                    last_result = run_selected_scan(
                         args, lcd, illuminator, ir_enabled, dashboard_state
                     )
                     hold_new_result = True
