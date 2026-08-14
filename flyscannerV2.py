@@ -1497,6 +1497,22 @@ class DashboardServer:
                 return web.json_response({"ok": False, "error": str(exc)}, status=503)
             return web.json_response(response, status=202 if response.get("ok") else 403)
 
+        async def network_forget(request: Any) -> Any:
+            try:
+                body = await request.json()
+                if not isinstance(body, dict) or body.get("confirm") is not True:
+                    raise ValueError("Explicit confirmation is required")
+                response = await asyncio.to_thread(
+                    network_helper_request,
+                    self.network_socket,
+                    {"command": "forget"},
+                )
+            except (ValueError, json.JSONDecodeError) as exc:
+                return web.json_response({"ok": False, "error": str(exc)}, status=400)
+            except Exception as exc:
+                return web.json_response({"ok": False, "error": str(exc)}, status=503)
+            return web.json_response(response, status=202 if response.get("ok") else 403)
+
         app = web.Application()
         app.add_routes(
             [
@@ -1509,6 +1525,7 @@ class DashboardServer:
                 web.get("/api/network/status", network_status),
                 web.get("/api/network/scan", network_scan),
                 web.post("/api/network/connect", network_connect),
+                web.post("/api/network/forget", network_forget),
             ]
         )
         runner = web.AppRunner(app, access_log=None)

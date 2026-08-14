@@ -49,8 +49,10 @@ the LCD when `.local` hostname resolution is unavailable.
 
 If no saved network is reachable, the Pi creates a unique password-protected
 setup hotspot. Connect to it and open `http://10.42.0.1:8080` to configure the
-deployment Wi-Fi from the dashboard. See [INSTALL_PI5.md](INSTALL_PI5.md) for
-installation, credentials, QR payloads, and recovery behavior.
+deployment Wi-Fi from the dashboard. It keeps failed profiles and periodically
+retries all saved Wi-Fi networks until one succeeds, restoring the hotspot after
+each unsuccessful retry. See [INSTALL_PI5.md](INSTALL_PI5.md) for installation,
+credentials, QR payloads, and recovery behavior.
 
 On startup the scanner also generates three device-specific QR-code PNGs for
 hotspot connection, hotspot dashboard access, and normal-network dashboard

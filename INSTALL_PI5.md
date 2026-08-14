@@ -27,7 +27,7 @@ camera interface on current Raspberry Pi OS.
 sudo apt update
 sudo apt full-upgrade -y
 sudo apt install -y python3-venv python3-dev python3-opencv python3-numpy \
-  python3-gpiozero python3-lgpio v4l-utils network-manager
+  python3-gpiozero python3-lgpio v4l-utils network-manager iw
 sudo usermod -aG video,gpio flyscanner
 ```
 
@@ -216,7 +216,7 @@ window with `--double-press-window SECONDS` and the screen duration with
 ### Fallback hotspot and first-time Wi-Fi setup
 
 At boot, the network service gives NetworkManager 45 seconds to connect to a
-saved Wi-Fi or Ethernet network. If none succeeds, it starts a
+saved Wi-Fi network. If none succeeds, it starts a
 password-protected 2.4 GHz hotspot with a unique name similar to
 `Flyscanner-A3F2`. Its simple per-device password uses the matching suffix, for
 example `flyscan-A3F2`. Connect a phone or laptop to that hotspot and open:
@@ -232,9 +232,26 @@ while the Pi changes radio mode. Once connected, use
 `http://flyscanner.local:8080` or double-press the physical button to display
 the new numeric address. The saved network reconnects after later reboots. If
 the submitted connection fails, the setup hotspot is restored automatically.
+The unsuccessful Wi-Fi profile is retained instead of discarded. While the
+hotspot is active, the service retries every saved Wi-Fi profile every two
+minutes indefinitely, but only while no phone or computer is associated with
+the hotspot. It never deliberately kicks an active setup user off for a blind
+background retry. If no saved profile connects, it restores the hotspot again.
+This also means a temporarily unavailable deployment network is joined later
+without requiring another setup session. Ethernet is managed independently and
+can stay connected while the Wi-Fi fallback behavior is tested. If hotspot
+client detection is unavailable, the safe behavior is to preserve the hotspot
+and postpone automatic retries.
 The simple setup form supports open networks and WPA/WPA2 Personal networks;
 enterprise Wi-Fi requiring usernames, certificates, or a captive portal still
 needs site-specific NetworkManager configuration.
+
+When connected to normal Wi-Fi, the dashboard's Network card includes **Forget
+current Wi-Fi**. After confirmation, it removes only the active profile, scans
+and tries every other saved Wi-Fi profile, and starts the setup hotspot only if
+none of those profiles can connect. The page may disconnect during this change;
+that is expected when it was opened through the Wi-Fi being forgotten. Wired
+Ethernet is not modified.
 
 Show the unique hotspot credentials before printing labels or deploying the
 device:
@@ -262,6 +279,16 @@ The generated password is short and QR-safe because this hotspot is intended
 only for temporary local setup. To choose your own values or alter the fallback
 delay, edit `/etc/default/flyscanner-network` and restart both services. Use
 unique hotspot credentials for every deployed device.
+
+The retry interval and per-profile connection timeout can also be changed in
+that file with `FLYSCANNER_WIFI_RETRY_SECONDS` and
+`FLYSCANNER_WIFI_CONNECT_TIMEOUT`. To request the hotspot or an immediate saved
+Wi-Fi retry manually while troubleshooting, run:
+
+```bash
+sudo /usr/local/lib/flyscanner/flyscanner-network.py hotspot
+sudo /usr/local/lib/flyscanner/flyscanner-network.py retry
+```
 
 The built-in Wi-Fi radio switches between hotspot and client modes; it does not
 keep the setup hotspot active after joining deployment Wi-Fi. A second USB

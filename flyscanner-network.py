@@ -20,6 +20,7 @@ from typing import Any
 
 HOTSPOT_PROFILE = "flyscanner-hotspot"
 DEFAULT_SOCKET_PATH = "/run/flyscanner-network/control.sock"
+NETWORKMANAGER_STAGING_DIR = Path("/run/NetworkManager/system-connections")
 
 
 class NmcliError(RuntimeError):
@@ -103,12 +104,19 @@ class NetworkManager:
         self.wait_seconds = max(
             5.0, float(os.environ.get("FLYSCANNER_HOTSPOT_WAIT_SECONDS", "45"))
         )
+        self.retry_seconds = max(
+            30.0, float(os.environ.get("FLYSCANNER_WIFI_RETRY_SECONDS", "120"))
+        )
+        self.connect_timeout = max(
+            5, int(os.environ.get("FLYSCANNER_WIFI_CONNECT_TIMEOUT", "20"))
+        )
         self._lock = threading.RLock()
         self._phase = "starting"
         self._detail = "Waiting for NetworkManager"
         self._offline_since = time.monotonic()
         self._stop = threading.Event()
         self._hotspot_reconciled = False
+        self._last_wifi_attempt = time.monotonic()
 
         if not self.hotspot_ssid or len(self.hotspot_ssid.encode("utf-8")) > 32:
             raise ValueError("Hotspot SSID must contain 1-32 UTF-8 bytes")
@@ -137,13 +145,47 @@ class NetworkManager:
                 active.append((fields[0], fields[1], fields[2]))
         return active
 
-    def uplink(self) -> tuple[str, str] | None:
+    def wifi_connection(self) -> tuple[str, str] | None:
+        interface = self.discover_interface()
+        for name, connection_type, device in self.active_connections():
+            if (
+                connection_type in {"802-11-wireless", "wifi"}
+                and name != HOTSPOT_PROFILE
+                and device == interface
+            ):
+                return "wifi", name
+        return None
+
+    def ethernet_connection(self) -> tuple[str, str] | None:
         for name, connection_type, _device in self.active_connections():
             if connection_type in {"802-3-ethernet", "ethernet"}:
                 return "ethernet", name
-            if connection_type in {"802-11-wireless", "wifi"} and name != HOTSPOT_PROFILE:
-                return "wifi", name
         return None
+
+    def wifi_ssid(self, profile_name: str) -> str | None:
+        try:
+            value = run_nmcli(
+                "-g", "802-11-wireless.ssid", "connection", "show", profile_name
+            )
+        except NmcliError:
+            return None
+        return value or None
+
+    def saved_wifi_profiles(self) -> list[str]:
+        output = run_nmcli(
+            "-t", "--escape", "yes", "-f", "NAME,TYPE,AUTOCONNECT", "connection", "show"
+        )
+        profiles: list[str] = []
+        for line in output.splitlines():
+            fields = split_terse(line)
+            if (
+                len(fields) >= 3
+                and fields[1] in {"802-11-wireless", "wifi"}
+                and fields[0] != HOTSPOT_PROFILE
+                and fields[2].lower() in {"yes", "true", "1"}
+            ):
+                profiles.append(fields[0])
+        return profiles
 
     def hotspot_active(self) -> bool:
         return any(name == HOTSPOT_PROFILE for name, _kind, _device in self.active_connections())
@@ -170,9 +212,10 @@ class NetworkManager:
         )
         staged_path: str | None = None
         try:
+            NETWORKMANAGER_STAGING_DIR.mkdir(parents=True, exist_ok=True)
             with tempfile.NamedTemporaryFile(
                 mode="w", encoding="utf-8", prefix="wifi-profile-",
-                suffix=".nmconnection", dir=self.socket_path.parent, delete=False,
+                suffix=".nmconnection", dir=NETWORKMANAGER_STAGING_DIR, delete=False,
             ) as secret:
                 secret.write(keyfile)
                 staged_path = secret.name
@@ -207,7 +250,7 @@ class NetworkManager:
 
     def start_hotspot(self) -> None:
         with self._lock:
-            if self.uplink() is not None:
+            if self.wifi_connection() is not None:
                 return
             self._phase = "starting_hotspot"
             self._detail = "Creating setup network"
@@ -218,6 +261,65 @@ class NetworkManager:
             self._detail = f"Connect to {self.hotspot_ssid}"
             self._hotspot_reconciled = True
             print(f"Fallback hotspot active: {self.hotspot_ssid} at 10.42.0.1", flush=True)
+
+    def hotspot_has_clients(self) -> bool:
+        """Return true when a station is associated; uncertainty is treated as busy."""
+        try:
+            result = subprocess.run(
+                ["iw", "dev", self.discover_interface(), "station", "dump"],
+                text=True,
+                capture_output=True,
+                timeout=5.0,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            print(f"Cannot inspect hotspot clients; preserving hotspot: {exc}", flush=True)
+            return True
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or "iw failed"
+            print(f"Cannot inspect hotspot clients; preserving hotspot: {detail}", flush=True)
+            return True
+        return any(line.startswith("Station ") for line in result.stdout.splitlines())
+
+    def retry_saved_wifi(self, restore_hotspot: bool = True) -> bool:
+        """Try every saved Wi-Fi profile once, restoring the hotspot on failure."""
+        with self._lock:
+            profiles = self.saved_wifi_profiles()
+            self._last_wifi_attempt = time.monotonic()
+            if not profiles:
+                return False
+            self._phase = "retrying_wifi"
+            self._detail = f"Trying {len(profiles)} saved Wi-Fi profile(s)"
+            print(f"Retrying saved Wi-Fi profiles: {', '.join(profiles)}", flush=True)
+            run_nmcli("connection", "down", HOTSPOT_PROFILE, check=False)
+            run_nmcli("radio", "wifi", "on")
+            run_nmcli("device", "wifi", "rescan", "ifname", self.discover_interface(), check=False)
+            for profile in profiles:
+                try:
+                    run_nmcli(
+                        "--wait", str(self.connect_timeout),
+                        "connection", "up", profile,
+                        "ifname", self.discover_interface(),
+                        timeout=float(self.connect_timeout + 5),
+                    )
+                except NmcliError as exc:
+                    print(f"Saved Wi-Fi profile {profile!r} failed: {exc}", flush=True)
+                    continue
+                if self.wifi_connection() is not None:
+                    self._phase = "connected"
+                    self._detail = f"Connected to Wi-Fi: {profile}"
+                    self._offline_since = time.monotonic()
+                    print(f"Connected using saved Wi-Fi profile: {profile}", flush=True)
+                    return True
+            self._phase = "wifi_retry_failed"
+            self._detail = (
+                "Saved Wi-Fi unavailable; restoring setup hotspot"
+                if restore_hotspot
+                else "Saved Wi-Fi unavailable"
+            )
+        if restore_hotspot:
+            self.start_hotspot()
+        return False
 
     def scan(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -299,28 +401,71 @@ class NetworkManager:
                     priority=100,
                 )
                 run_nmcli(
-                    "--wait", "35", "connection", "up", profile_name,
-                    "ifname", self.discover_interface(), timeout=45.0,
+                    "--wait", str(self.connect_timeout), "connection", "up", profile_name,
+                    "ifname", self.discover_interface(),
+                    timeout=float(self.connect_timeout + 5),
                 )
                 self._phase = "connected"
                 self._detail = f"Connected to {ssid}"
                 self._offline_since = time.monotonic()
+                self._last_wifi_attempt = time.monotonic()
                 print(f"Connected to configured Wi-Fi: {ssid}", flush=True)
         except Exception as exc:
             print(f"Wi-Fi connection failed; restoring hotspot: {exc}", flush=True)
             with self._lock:
                 self._phase = "connection_failed"
                 self._detail = "Connection failed; restoring setup network"
-                run_nmcli("connection", "delete", profile_name, check=False)
+                self._last_wifi_attempt = time.monotonic()
             try:
                 self.start_hotspot()
             except Exception as hotspot_exc:
                 print(f"Could not restore fallback hotspot: {hotspot_exc}", flush=True)
 
+    def request_forget_current_wifi(self) -> str:
+        with self._lock:
+            wifi = self.wifi_connection()
+            if wifi is None:
+                raise RuntimeError("No active Wi-Fi connection can be forgotten")
+            profile_name = wifi[1]
+            if self._phase in {"switching", "forgetting_wifi"}:
+                raise RuntimeError("A Wi-Fi change is already in progress")
+            self._phase = "forgetting_wifi"
+            self._detail = f"Forgetting Wi-Fi profile: {profile_name}"
+        threading.Thread(
+            target=self._forget_wifi_after_response,
+            args=(profile_name,),
+            name="wifi-forget",
+            daemon=True,
+        ).start()
+        return profile_name
+
+    def _forget_wifi_after_response(self, profile_name: str) -> None:
+        # Let the browser display the expected-disconnect warning first.
+        time.sleep(2.0)
+        try:
+            with self._lock:
+                run_nmcli("connection", "delete", profile_name)
+                self._phase = "wifi_forgotten"
+                self._detail = "Saved Wi-Fi removed; checking other saved networks"
+                self._offline_since = time.monotonic() - self.wait_seconds
+                self._last_wifi_attempt = time.monotonic()
+                print(f"Forgot Wi-Fi profile: {profile_name}", flush=True)
+            connected = self.retry_saved_wifi()
+            if not connected and not self.hotspot_active():
+                self.start_hotspot()
+        except Exception as exc:
+            with self._lock:
+                self._phase = "forget_error"
+                self._detail = str(exc)
+            print(f"Could not forget Wi-Fi profile {profile_name!r}: {exc}", flush=True)
+
     def status(self, include_credentials: bool = False) -> dict[str, Any]:
         with self._lock:
             hotspot = self.hotspot_active()
-            uplink = self.uplink()
+            wifi = self.wifi_connection()
+            ethernet = self.ethernet_connection()
+            uplink = wifi or ethernet
+            current_wifi_ssid = self.wifi_ssid(wifi[1]) if wifi else None
             payload: dict[str, Any] = {
                 "phase": self._phase,
                 "detail": self._detail,
@@ -329,6 +474,11 @@ class NetworkManager:
                 "setup_url": "http://10.42.0.1:8080" if hotspot else None,
                 "uplink_type": uplink[0] if uplink else None,
                 "connection_name": uplink[1] if uplink else None,
+                "wifi_connected": wifi is not None,
+                "wifi_ssid": current_wifi_ssid,
+                "ethernet_connected": ethernet is not None,
+                "saved_wifi_profiles": len(self.saved_wifi_profiles()),
+                "wifi_retry_seconds": self.retry_seconds,
             }
             if include_credentials:
                 payload["hotspot_ssid"] = self.hotspot_ssid
@@ -353,21 +503,37 @@ class NetworkManager:
                 "ok": True,
                 "message": "Settings saved. The hotspot will now disconnect while the scanner joins Wi-Fi.",
             }
+        if command == "hotspot":
+            self.start_hotspot()
+            return {"ok": True, **self.status()}
+        if command == "retry":
+            connected = self.retry_saved_wifi()
+            return {"ok": True, "connected": connected, **self.status()}
+        if command == "forget":
+            profile_name = self.request_forget_current_wifi()
+            return {
+                "ok": True,
+                "profile_name": profile_name,
+                "message": (
+                    "The saved Wi-Fi is being removed. Flyscanner will try other "
+                    "saved networks first, then start its setup hotspot if none connect."
+                ),
+            }
         raise ValueError("Unknown network command")
 
     def monitor(self) -> None:
         while not self._stop.wait(5.0):
             try:
                 with self._lock:
-                    if self._phase == "switching":
+                    if self._phase in {"switching", "forgetting_wifi"}:
                         continue
-                    uplink = self.uplink()
+                    wifi = self.wifi_connection()
                     hotspot = self.hotspot_active()
-                    if uplink:
+                    if wifi:
                         if hotspot:
                             run_nmcli("connection", "down", HOTSPOT_PROFILE, check=False)
                         self._phase = "connected"
-                        self._detail = f"Connected via {uplink[0]}: {uplink[1]}"
+                        self._detail = f"Connected to Wi-Fi: {wifi[1]}"
                         self._offline_since = time.monotonic()
                     elif hotspot:
                         if not self._hotspot_reconciled:
@@ -377,10 +543,19 @@ class NetworkManager:
                             self.ensure_hotspot_profile()
                             run_nmcli("--wait", "20", "connection", "up", HOTSPOT_PROFILE)
                             self._hotspot_reconciled = True
-                        self._phase = "hotspot"
-                        self._detail = f"Connect to {self.hotspot_ssid}"
+                        if time.monotonic() - self._last_wifi_attempt >= self.retry_seconds:
+                            if self.hotspot_has_clients():
+                                self._phase = "hotspot_in_use"
+                                self._detail = "Setup client connected; Wi-Fi retry postponed"
+                            else:
+                                self.retry_saved_wifi()
+                        else:
+                            self._phase = "hotspot"
+                            self._detail = f"Connect to {self.hotspot_ssid}"
                     elif time.monotonic() - self._offline_since >= self.wait_seconds:
-                        self.start_hotspot()
+                        self.retry_saved_wifi()
+                        if self.wifi_connection() is None and not self.hotspot_active():
+                            self.start_hotspot()
                     else:
                         remaining = max(0, round(self.wait_seconds - (time.monotonic() - self._offline_since)))
                         self._phase = "waiting"
@@ -441,7 +616,12 @@ def run_daemon() -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("daemon", "status", "credentials"), nargs="?", default="daemon")
+    parser.add_argument(
+        "command",
+        choices=("daemon", "status", "credentials", "hotspot", "retry", "forget"),
+        nargs="?",
+        default="daemon",
+    )
     parser.add_argument("--socket", default=os.environ.get("FLYSCANNER_NETWORK_SOCKET", DEFAULT_SOCKET_PATH))
     args = parser.parse_args()
     if args.command == "daemon":
