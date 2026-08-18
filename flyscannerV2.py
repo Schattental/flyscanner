@@ -24,6 +24,7 @@ import csv
 import hashlib
 import json
 import math
+import os
 import queue
 import re
 import shutil
@@ -2031,14 +2032,18 @@ def system_health(output_dir: Path) -> dict[str, float | None]:
     }
 
 
-def network_helper_request(socket_path: str, payload: dict[str, Any]) -> dict[str, Any]:
+def network_helper_request(
+    socket_path: str,
+    payload: dict[str, Any],
+    timeout: float = 35.0,
+) -> dict[str, Any]:
     """Send one bounded JSON request to the privileged local network helper."""
     encoded = (json.dumps(payload) + "\n").encode("utf-8")
     if len(encoded) > 65536:
         raise ValueError("Network request is too large")
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.settimeout(35.0)
+            client.settimeout(timeout)
             client.connect(socket_path)
             client.sendall(encoded)
             response = client.makefile("rb").readline(65537)
@@ -2050,6 +2055,21 @@ def network_helper_request(socket_path: str, payload: dict[str, Any]) -> dict[st
     if not isinstance(decoded, dict):
         raise RuntimeError("Network setup helper returned an invalid response")
     return decoded
+
+
+def report_scanner_busy(network_socket: str, busy: bool) -> None:
+    """Tell the Wi-Fi helper not to change radio modes during a recording."""
+    try:
+        response = network_helper_request(
+            network_socket,
+            {"command": "scanner_busy", "busy": busy, "pid": os.getpid() if busy else None},
+            timeout=2.0,
+        )
+        if not response.get("ok"):
+            raise RuntimeError(str(response.get("error", "unknown network-helper error")))
+    except Exception as exc:
+        state = "busy" if busy else "idle"
+        print(f"Warning: could not report scanner {state} state: {exc}", file=sys.stderr)
 
 
 def wifi_qr_escape(value: str) -> str:
@@ -2957,7 +2977,11 @@ def main() -> int:
             dashboard_server.start()
 
         if args.run_now:
-            run_selected_scan(args, lcd, illuminator, ir_enabled, dashboard_state)
+            report_scanner_busy(args.network_socket, True)
+            try:
+                run_selected_scan(args, lcd, illuminator, ir_enabled, dashboard_state)
+            finally:
+                report_scanner_busy(args.network_socket, False)
             return 0
 
         button = setup_button(args)
@@ -3053,6 +3077,7 @@ def main() -> int:
                     continue
 
                 dashboard_state.begin_scan()
+                report_scanner_busy(args.network_socket, True)
                 try:
                     last_result = run_selected_scan(
                         args, lcd, illuminator, ir_enabled, dashboard_state
@@ -3077,6 +3102,7 @@ def main() -> int:
                     # tested with the next button press.
                     time.sleep(1.0)
                 finally:
+                    report_scanner_busy(args.network_socket, False)
                     dashboard_state.end_scan()
         finally:
             button.close()

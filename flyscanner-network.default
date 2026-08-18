@@ -2,7 +2,9 @@
 # FLYSCANNER_WIFI_INTERFACE=wlan0
 # FLYSCANNER_HOTSPOT_SSID=Flyscanner-A3F2
 # FLYSCANNER_HOTSPOT_PASSWORD=replace-with-a-unique-password
-FLYSCANNER_HOTSPOT_WAIT_SECONDS=45
-# Once fallback mode is active, retry every saved Wi-Fi profile indefinitely.
+# Brief boot grace before fallback mode is established.
+FLYSCANNER_HOTSPOT_WAIT_SECONDS=5
+# While idle in fallback mode, scan for visible saved Wi-Fi this often. The
+# hotspot stays active unless a known SSID is actually visible.
 FLYSCANNER_WIFI_RETRY_SECONDS=120
 FLYSCANNER_WIFI_CONNECT_TIMEOUT=20

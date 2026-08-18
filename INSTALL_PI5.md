@@ -319,8 +319,9 @@ window with `--double-press-window SECONDS` and the screen duration with
 
 ### Fallback hotspot and first-time Wi-Fi setup
 
-At boot, the network service gives NetworkManager 45 seconds to connect to a
-saved Wi-Fi network. If none succeeds, it starts a
+At boot, the network service gives NetworkManager five seconds to finish an
+existing Wi-Fi connection. If no Wi-Fi client connection is fully established,
+it starts a
 password-protected 2.4 GHz hotspot with a unique name similar to
 `Flyscanner-A3F2`. Its simple per-device password uses the matching suffix, for
 example `flyscan-A3F2`. Connect a phone or laptop to that hotspot and open:
@@ -335,27 +336,31 @@ browser and any SSH session over the hotspot disconnect about two seconds later
 while the Pi changes radio mode. Once connected, use
 `http://flyscanner.local:8080` or double-press the physical button to display
 the new numeric address. The saved network reconnects after later reboots. If
-the submitted connection fails, the setup hotspot is restored automatically.
-The unsuccessful Wi-Fi profile is retained instead of discarded. While the
-hotspot is active, the service retries every saved Wi-Fi profile every two
-minutes indefinitely, but only while no phone or computer is associated with
-the hotspot. It never deliberately kicks an active setup user off for a blind
-background retry. If no saved profile connects, it restores the hotspot again.
-This also means a temporarily unavailable deployment network is joined later
-without requiring another setup session. Ethernet is managed independently and
-can stay connected while the Wi-Fi fallback behavior is tested. If hotspot
-client detection is unavailable, the safe behavior is to preserve the hotspot
-and postpone automatic retries.
+the submitted connection fails, the setup hotspot is restored automatically and
+the unsuccessful Wi-Fi profile is retained instead of discarded.
+
+While fallback mode is active, the setup hotspot remains available even when
+Ethernet is connected. Every two minutes, while the scanner is idle, the Wi-Fi
+radio scans without first disabling the hotspot. It compares visible SSIDs with
+saved profiles. If none match, nothing is disconnected and the hotspot stays
+available. Only when a saved SSID is actually visible does the Pi switch from
+hotspot mode and attempt that profile; a failed attempt immediately restores
+the hotspot. A recording pauses this automatic scan/switch behavior, and the
+first idle monitor pass after recording scans again. This prevents an old or
+out-of-range saved profile from making the scanner disappear for repeated
+connection timeouts while still allowing a deployment network to be joined
+automatically when it returns. A hotspot client may disconnect when this
+intentional switch to a visible known network occurs.
 The simple setup form supports open networks and WPA/WPA2 Personal networks;
 enterprise Wi-Fi requiring usernames, certificates, or a captive portal still
 needs site-specific NetworkManager configuration.
 
 When connected to normal Wi-Fi, the dashboard's Network card includes **Forget
-current Wi-Fi**. After confirmation, it removes only the active profile, scans
-and tries every other saved Wi-Fi profile, and starts the setup hotspot only if
-none of those profiles can connect. The page may disconnect during this change;
-that is expected when it was opened through the Wi-Fi being forgotten. Wired
-Ethernet is not modified.
+current Wi-Fi**. After confirmation, it removes only the active profile and
+restores the setup hotspot. From there the same scan-first logic can join
+another visible saved profile. The page may disconnect during this change; that
+is expected when it was opened through the Wi-Fi being forgotten. Wired
+Ethernet is not modified and does not suppress the setup hotspot.
 
 Show the unique hotspot credentials before printing labels or deploying the
 device:

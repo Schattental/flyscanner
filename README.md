@@ -80,10 +80,12 @@ retention count. Lower saved resolutions normally require less space.
 
 If no saved network is reachable, the Pi creates a unique password-protected
 setup hotspot. Connect to it and open `http://10.42.0.1:8080` to configure the
-deployment Wi-Fi from the dashboard. It keeps failed profiles and periodically
-retries all saved Wi-Fi networks until one succeeds, restoring the hotspot after
-each unsuccessful retry. See [INSTALL_PI5.md](INSTALL_PI5.md) for installation,
-credentials, QR payloads, and recovery behavior.
+deployment Wi-Fi from the dashboard. Whenever Wi-Fi is disconnected, the
+hotspot remains available even if Ethernet is connected. While the scanner is
+idle it scans in hotspot mode and switches only when a visible SSID matches a
+saved profile; recording pauses automatic Wi-Fi changes. A failed connection
+restores the hotspot immediately. See [INSTALL_PI5.md](INSTALL_PI5.md) for
+installation, credentials, QR payloads, and recovery behavior.
 
 On startup the scanner also generates three device-specific QR-code PNGs for
 hotspot connection, hotspot dashboard access, and normal-network dashboard
