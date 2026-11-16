@@ -23,6 +23,7 @@ import asyncio
 import csv
 import hashlib
 import json
+import logging
 import math
 import os
 import queue
@@ -344,13 +345,13 @@ def parse_args() -> argparse.Namespace:
         "--double-press-window",
         type=float,
         default=0.6,
-        help="Seconds after a short press to wait for a second press that displays network info.",
+        help="Seconds between taps: double press shows addresses; triple press forces the setup hotspot.",
     )
     parser.add_argument(
         "--network-display-time",
         type=float,
         default=8.0,
-        help="Seconds to show dashboard network information on the LCD.",
+        help="Seconds to show each LAN/Wi-Fi address page on the LCD.",
     )
     parser.add_argument(
         "--ir-gpio",
@@ -946,21 +947,31 @@ def wait_for_idle_action(
         time.sleep(debounce_seconds)
         return "capture_settings"
 
-    # A single press is intentionally delayed by this short window. Ignore the
-    # immediate release bounce, then look for one more distinct press.
+    # Delay single/double actions until another tap can be ruled out. Short
+    # release debounce keeps a quick triple press from being swallowed.
     time.sleep(min(debounce_seconds, 0.08))
-    second_press_deadline = released_at + double_press_window
-    while time.monotonic() < second_press_deadline:
+    presses = 1
+    next_press_deadline = released_at + double_press_window
+    while time.monotonic() < next_press_deadline:
         remote_command = dashboard.take_idle_command() if dashboard is not None else None
         if remote_command is not None:
             return remote_command
         if button.is_pressed:
+            pressed_at = time.monotonic()
             while button.is_pressed:
                 time.sleep(0.02)
-            time.sleep(debounce_seconds)
-            return "show_network"
+            released_at = time.monotonic()
+            if released_at - pressed_at >= long_press_seconds:
+                time.sleep(debounce_seconds)
+                return "capture_settings"
+            presses += 1
+            if presses == 3:
+                time.sleep(debounce_seconds)
+                return "force_hotspot"
+            next_press_deadline = released_at + double_press_window
+            time.sleep(min(debounce_seconds, 0.08))
         time.sleep(0.02)
-    return "scan"
+    return "show_network" if presses == 2 else "scan"
 
 
 def local_ipv4_address() -> str | None:
@@ -985,6 +996,28 @@ def local_ipv4_address() -> str | None:
     return None
 
 
+def local_interface_ipv4_addresses() -> dict[str, list[str]]:
+    """Read interface addresses even if the privileged helper is unavailable."""
+    addresses: dict[str, list[str]] = {"lan_ipv4": [], "wifi_ipv4": []}
+    try:
+        result = subprocess.run(
+            ["ip", "-j", "-4", "address", "show"],
+            capture_output=True, text=True, check=True, timeout=3.0,
+        )
+        for interface in json.loads(result.stdout):
+            if interface.get("link_type") != "ether":
+                continue
+            name = interface["ifname"]
+            key = "wifi_ipv4" if (Path("/sys/class/net") / name / "wireless").exists() else "lan_ipv4"
+            addresses[key].extend(
+                entry["local"] for entry in interface.get("addr_info", [])
+                if entry.get("family") == "inet" and entry.get("scope") != "host"
+            )
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError) as exc:
+        print(f"Could not enumerate network addresses: {exc}", file=sys.stderr)
+    return addresses
+
+
 def show_network_info(
     lcd: CharacterLcd | NullLcd,
     web_port: int,
@@ -994,19 +1027,19 @@ def show_network_info(
     hotspot_active = False
     try:
         network_status = network_helper_request(network_socket, {"command": "status"})
-        hotspot_active = bool(network_status.get("ok") and network_status.get("hotspot_active"))
+        if not network_status.get("ok"):
+            raise RuntimeError("Network helper status unavailable")
+        hotspot_active = bool(network_status.get("hotspot_active"))
+        addresses = {key: network_status[key] for key in ("lan_ipv4", "wifi_ipv4")}
     except Exception:
-        pass
-    address = "10.42.0.1" if hotspot_active else local_ipv4_address()
+        addresses = local_interface_ipv4_addresses()
     hostname = socket.gethostname().split(".", 1)[0]
-    if address is None:
-        lcd.write("Network offline", "Try again later")
-        print("Dashboard address unavailable: network is offline")
-    else:
-        lcd.write(f"{'Setup WiFi' if hotspot_active else 'Dashboard'} :{web_port}", address)
-        print(f"Dashboard: http://{address}:{web_port}")
-        print(f"mDNS shortcut: http://{hostname}.local:{web_port}")
-    time.sleep(display_seconds)
+    for label, key in (("LAN", "lan_ipv4"), ("Setup WiFi" if hotspot_active else "WiFi", "wifi_ipv4")):
+        for address in addresses[key] or [None]:
+            lcd.write(f"{label} :{web_port}", address or "Not connected")
+            print(f"{label}: http://{address}:{web_port}" if address else f"{label}: not connected")
+            time.sleep(display_seconds)
+    print(f"mDNS shortcut: http://{hostname}.local:{web_port}")
 
 
 def configure_capture_settings(
@@ -2374,6 +2407,7 @@ class DashboardServer:
     async def _serve(self) -> None:
         try:
             from aiohttp import WSMsgType, web
+            from aiohttp.abc import AbstractAccessLogger
         except ImportError as exc:
             raise RuntimeError(
                 "aiohttp is missing; run .venv/bin/python -m pip install -r requirements-pi5.txt"
@@ -2613,6 +2647,7 @@ class DashboardServer:
             return web.json_response(response, status=200 if response.get("ok") else 403)
 
         async def network_connect(request: Any) -> Any:
+            require_same_origin(request)
             try:
                 body = await request.json()
                 if not isinstance(body, dict):
@@ -2633,6 +2668,7 @@ class DashboardServer:
             return web.json_response(response, status=202 if response.get("ok") else 403)
 
         async def network_forget(request: Any) -> Any:
+            require_same_origin(request)
             try:
                 body = await request.json()
                 if not isinstance(body, dict) or body.get("confirm") is not True:
@@ -2641,6 +2677,21 @@ class DashboardServer:
                     network_helper_request,
                     self.network_socket,
                     {"command": "forget"},
+                )
+            except (ValueError, json.JSONDecodeError) as exc:
+                return web.json_response({"ok": False, "error": str(exc)}, status=400)
+            except Exception as exc:
+                return web.json_response({"ok": False, "error": str(exc)}, status=503)
+            return web.json_response(response, status=202 if response.get("ok") else 403)
+
+        async def network_forget_all(request: Any) -> Any:
+            require_same_origin(request)
+            try:
+                body = await request.json()
+                if not isinstance(body, dict) or body.get("confirm") is not True:
+                    raise ValueError("Explicit confirmation is required")
+                response = await asyncio.to_thread(
+                    network_helper_request, self.network_socket, {"command": "forget_all"}
                 )
             except (ValueError, json.JSONDecodeError) as exc:
                 return web.json_response({"ok": False, "error": str(exc)}, status=400)
@@ -2667,9 +2718,24 @@ class DashboardServer:
                 web.get("/api/network/scan", network_scan),
                 web.post("/api/network/connect", network_connect),
                 web.post("/api/network/forget", network_forget),
+                web.post("/api/network/forget-all", network_forget_all),
             ]
         )
-        runner = web.AppRunner(app, access_log=None)
+        class DashboardAccessLogger(AbstractAccessLogger):
+            def log(self, request: Any, response: Any, elapsed: float) -> None:
+                if request.path in {"/api/network/status", "/api/scanner/settings"} and response.status < 400:
+                    return
+                # Record reachability evidence without query strings or bodies.
+                self.logger.info(
+                    "Dashboard HTTP method=%s path=%r status=%s peer=%s elapsed=%.3fs",
+                    request.method, request.path, response.status, request.remote, elapsed,
+                )
+
+        access_logger = logging.getLogger("flyscanner.http")
+        access_logger.setLevel(logging.INFO)
+        if not access_logger.handlers:
+            access_logger.addHandler(logging.StreamHandler())
+        runner = web.AppRunner(app, access_log=access_logger, access_log_class=DashboardAccessLogger)
         await runner.setup()
         site = web.TCPSite(runner, self.host, self.port)
         await site.start()
@@ -3047,8 +3113,23 @@ def main() -> int:
                     elif command_type not in {"settings", "settings_and_scan"}:
                         print(f"Ignoring unknown dashboard command: {command_type}", file=sys.stderr)
                         continue
+                if action == "force_hotspot":
+                    dashboard_state.set_status("forcing_hotspot", "Starting setup hotspot")
+                    lcd.write("Setup WiFi", "Starting...")
+                    try:
+                        response = network_helper_request(args.network_socket, {"command": "hotspot"})
+                        if not response.get("ok"):
+                            raise RuntimeError(response.get("error", "Could not force hotspot"))
+                        print("Triple press: setup hotspot forced; saved Wi-Fi preserved")
+                    except Exception as exc:
+                        dashboard_state.set_status("network_error", str(exc))
+                        lcd.write("WiFi error", "See service log")
+                        print(f"Could not force setup hotspot: {exc}", file=sys.stderr)
+                        time.sleep(3.0)
+                        continue
+                    action = "show_network"
                 if action == "show_network":
-                    dashboard_state.set_status("showing_network", "Dashboard address on LCD")
+                    dashboard_state.set_status("showing_network", "LAN and Wi-Fi addresses on LCD")
                     show_network_info(
                         lcd,
                         args.web_port,

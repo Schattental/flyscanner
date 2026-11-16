@@ -88,8 +88,12 @@ has the following behavior:
 
 - Single short press while idle: start a capture after a 0.6-second
   double-press window, using the displayed runtime and IR setting.
-- Double press while idle: show the dashboard port and current LAN IP address
-  on the LCD for eight seconds.
+- Double press while idle: cycle through wired LAN and Wi-Fi IPv4 addresses,
+  showing the dashboard port and each address for eight seconds per page.
+  Disconnected interfaces are labeled; hotspot Wi-Fi is labeled Setup WiFi.
+- Triple short press while idle: force the setup hotspot and pause automatic
+  Wi-Fi reconnection without deleting credentials. Use the same 0.6-second
+  window between taps. Network gestures do not start a capture.
 - Long press while idle (1.5 seconds): open capture settings at the runtime
   screen.
 - Short press on the runtime screen: cycle through 30 seconds, 5 minutes,
@@ -223,6 +227,12 @@ sudo install -m 0644 flyscanner-network.default \
   /etc/default/flyscanner-network
 sudo install -m 0644 flyscanner.service /etc/systemd/system/flyscanner.service
 sudo install -m 0644 flyscanner.default /etc/default/flyscanner
+sudo install -d -m 0755 /etc/systemd/journald.conf.d
+sudo install -m 0644 flyscanner-journald.conf \
+  /etc/systemd/journald.conf.d/99-flyscanner.conf
+sudo systemd-tmpfiles --create --prefix /var/log/journal
+sudo systemctl restart systemd-journald
+sudo journalctl --flush
 sudo systemctl daemon-reload
 sudo systemctl enable --now flyscanner-network.service flyscanner.service
 sudo systemctl restart flyscanner-network.service flyscanner.service
@@ -312,10 +322,12 @@ Open the numeric address as:
 http://PI_ADDRESS:8080
 ```
 
-For example, `http://192.168.1.42:8080`. The LCD displays `Dashboard :8080` on
-its first line and the numeric IP on its second line. Adjust the recognition
-window with `--double-press-window SECONDS` and the screen duration with
-`--network-display-time SECONDS`.
+For example, `http://192.168.1.42:8080`. The LCD cycles through `LAN :8080`
+and `WiFi :8080` pages, with each IPv4 address on the second line. An active setup hotspot uses `Setup WiFi :8080`;
+interfaces without an address show `Not connected`. Use the LAN address from a
+client on the wired LAN and the setup address only after joining the hotspot.
+Adjust the inter-tap window with `--double-press-window SECONDS` and the
+duration of each address page with `--network-display-time SECONDS`.
 
 ### Fallback hotspot and first-time Wi-Fi setup
 
@@ -362,6 +374,23 @@ another visible saved profile. The page may disconnect during this change; that
 is expected when it was opened through the Wi-Fi being forgotten. Wired
 Ethernet is not modified and does not suppress the setup hotspot.
 
+**Forget all networks** is always visible in the Network card, including while
+in hotspot mode or disconnected from client Wi-Fi. After confirmation, it
+removes all saved client Wi-Fi profiles (including those with autoconnect
+disabled) and holds the setup hotspot open. It preserves Ethernet settings,
+other access-point profiles, and the setup hotspot password. Network changes
+are rejected during recording or while another Wi-Fi change is in progress.
+
+If connected Wi-Fi is unusable, **triple-press the physical button while idle**
+to hold the setup hotspot open without deleting any credentials. Both the
+helper and NetworkManager stop automatically reconnecting on the Wi-Fi
+interface. Recovery mode survives a helper restart and ends after a successful
+explicit **Save and connect**, an administrator `retry` command, or a reboot.
+An unsuccessful explicit connection leaves recovery mode enabled. In forced
+hotspot mode the helper does not perform periodic radio scans. The physical
+gesture is available at the idle prompt; button input during recording or capture-settings
+menus retains its existing behavior.
+
 Show the unique hotspot credentials before printing labels or deploying the
 device:
 
@@ -399,6 +428,10 @@ sudo /usr/local/lib/flyscanner/flyscanner-network.py hotspot
 sudo /usr/local/lib/flyscanner/flyscanner-network.py retry
 ```
 
+`hotspot` now forces recovery even when client Wi-Fi is connected, preserving
+saved profiles. `retry` releases recovery mode and attempts visible saved Wi-Fi.
+The CLI also supports `forget_all`, equivalent to the dashboard action.
+
 The built-in Wi-Fi radio switches between hotspot and client modes; it does not
 keep the setup hotspot active after joining deployment Wi-Fi. A second USB
 Wi-Fi adapter is needed for a permanent simultaneous hotspot.
@@ -410,12 +443,36 @@ that key login works.
 
 The dashboard intentionally has no login. Its scanner controls are available to
 anyone who can reach port 8080; cross-origin browser requests are rejected, but
-that is not authentication. Wi-Fi changes are accepted only while the protected
-setup hotspot is active. Keep dashboard access on a trusted local network, use
+that is not authentication. New Wi-Fi credentials are accepted only while the
+protected setup hotspot is active. Forget controls are also available from the
+normal LAN dashboard. Keep dashboard access on a trusted local network, use
 the per-device hotspot password, and do not forward port 8080 from your router
 to the internet. Change the port with `--web-port PORT`, bind only to one
 interface with `--web-host ADDRESS`, or turn it off with `--no-web` in
 `/etc/default/flyscanner`.
+
+### Retained diagnostic logs
+
+`flyscanner-journald.conf` overrides Raspberry Pi OS's volatile-journal default.
+It retains system journals across reboots for up to 30 days, subject to a 64 MiB
+system-wide cap (16 MiB for a runtime journal). Files remain on the device under
+`/var/log/journal`, outside the repository. Network state/address changes, scan
+results, connection failures, and dashboard HTTP requests are logged. Request
+bodies and query strings are excluded from dashboard access logs; normal
+status polling is omitted. Wi-Fi passwords are not logged. The limit applies
+to the whole system journal, so busy devices may retain fewer than 30 days.
+
+After an incident, inspect both application services and NetworkManager:
+
+```bash
+sudo journalctl --list-boots
+sudo journalctl -b -1 -u flyscanner-network.service -u flyscanner.service -u NetworkManager.service
+sudo journalctl --since "today" -u flyscanner-network.service -u flyscanner.service -u NetworkManager.service
+sudo journalctl --disk-usage
+```
+
+Previous volatile logs cannot be recovered. Clock corrections can affect boot
+wall-clock timestamps; use `journalctl -b -o short-monotonic` for event ordering.
 
 Useful administration commands:
 

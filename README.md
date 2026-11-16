@@ -28,6 +28,7 @@ service.
 - `flyscanner-network.py` — fallback hotspot and Wi-Fi onboarding helper
 - `flyscanner-network.service` — privileged network helper service template
 - `flyscanner-network.default` — optional hotspot settings template
+- `flyscanner-journald.conf` — bounded persistent system journal configuration
 - `flyscanner.default` — command-line configuration template
 - `requirements-pi5.txt` — Python packages
 - `INSTALL_PI5.md` — fresh-device installation and wiring guide
@@ -44,8 +45,10 @@ After installation, open:
 http://flyscanner.local:8080
 ```
 
-Double-press the physical button to display the Pi's current numeric address on
-the LCD when `.local` hostname resolution is unavailable.
+Double-press the physical button to cycle through wired LAN and Wi-Fi addresses
+on the LCD (eight seconds per page). Triple-press while idle to force the setup
+hotspot, even when connected Wi-Fi is unusable. Saved credentials are preserved;
+automatic reconnection pauses until an explicit connection/retry or a reboot.
 
 Long-press the button to select a 30-second, 5-minute, 10-minute, or 24-hour
 runtime; long-press again to advance to IR settings, then long-press once more
@@ -85,7 +88,14 @@ hotspot remains available even if Ethernet is connected. While the scanner is
 idle it scans in hotspot mode and switches only when a visible SSID matches a
 saved profile; recording pauses automatic Wi-Fi changes. A failed connection
 restores the hotspot immediately. See [INSTALL_PI5.md](INSTALL_PI5.md) for
-installation, credentials, QR payloads, and recovery behavior.
+installation, credentials, QR payloads, and recovery behavior. The Network card
+always includes **Forget all networks** to remove every saved client Wi-Fi
+profile, including disconnected profiles, and keep the setup hotspot available.
+Ethernet and the hotspot password are preserved.
+
+The installation enables journals retained across boots for up to 30 days,
+subject to a 64 MiB system-journal cap. Network transitions, interface addresses,
+and dashboard requests are recorded without passwords or request bodies.
 
 On startup the scanner also generates three device-specific QR-code PNGs for
 hotspot connection, hotspot dashboard access, and normal-network dashboard

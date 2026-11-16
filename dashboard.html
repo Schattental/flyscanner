@@ -151,7 +151,7 @@
             <label>Button debounce (seconds)<input id="setButtonDebounce" type="number" min="0" max="2" step="0.01"></label>
             <label>Long press (seconds)<input id="setLongPress" type="number" min="0.5" max="5" step="0.1"></label>
             <label>Double-press window (seconds)<input id="setDoubleWindow" type="number" min="0.2" max="2" step="0.1"></label>
-            <label>Network display (seconds)<input id="setNetworkDisplay" type="number" min="1" max="30" step="0.1"></label>
+            <label>Network display (seconds per page)<input id="setNetworkDisplay" type="number" min="1" max="30" step="0.1"></label>
           </div></details>
         </div>
         <div class="settings-actions"><button id="saveSettings" type="submit" disabled>Save settings</button><button id="reloadSettings" class="secondary" type="button" disabled>Discard unsaved changes</button><button id="resetSettings" class="danger" type="button" disabled>Reset to defaults</button><span id="scannerControlMessage" class="notice">Loading scanner settings…</span></div>
@@ -159,7 +159,7 @@
     </article>
     <article class="card image"><h2>Analysis alignment</h2><div id="imageEmpty" class="empty">The first completed scan will appear here.</div><img id="image" hidden alt="Latest analysis alignment frame"></article>
     <article class="card details"><h2>Latest capture</h2><div id="captureDetails" class="kv"><span class="muted">No capture metadata yet.</span></div><div id="downloadPanel" class="download-panel" hidden><div class="download-row"><label>Number of recent videos<input id="videoCount" type="number" min="1" value="1" inputmode="numeric"></label><a id="downloadVideos" class="button-link" href="/download-videos?count=1">Download latest video</a></div><span id="videoAvailability" class="muted"></span></div><p><a class="button-link secondary" href="/scan_history.csv" download>Download CSV history</a></p></article>
-    <article id="networkCard" class="card network"><h2>Network</h2><div class="kv"><span>Mode</span><span id="networkMode">Checking…</span><span>Connection</span><span id="networkConnection">—</span></div><div id="wifiSetup" hidden><p class="notice">The setup hotspot stays available while Flyscanner scans periodically for visible saved Wi-Fi. Choose a network below to connect immediately.</p><div class="network-actions"><button id="scanWifi" class="secondary" type="button">Scan nearby Wi-Fi</button></div><div class="network-form"><label>Nearby networks<select id="wifiList"><option value="">Select or enter a network</option></select></label><label>Wi-Fi name<input id="wifiSsid" maxlength="32" autocomplete="off" placeholder="Network name"></label><label>Password<input id="wifiPassword" type="password" maxlength="63" autocomplete="new-password" placeholder="Leave blank for open Wi-Fi"></label></div><div class="network-actions"><button id="saveWifi" type="button">Save and connect</button></div><p id="networkMessage" class="notice"></p></div><div id="wifiForget" hidden><p class="notice">Remove the current Wi-Fi credentials and return to the setup hotspot. Visible saved networks can reconnect automatically while the scanner is idle.</p><div class="network-actions"><button id="forgetWifi" class="danger" type="button">Forget current Wi-Fi</button></div><p id="forgetMessage" class="notice"></p></div></article>
+    <article id="networkCard" class="card network"><h2>Network</h2><div class="kv"><span>Mode</span><span id="networkMode">Checking…</span><span>Connection</span><span id="networkConnection">—</span><span>Addresses</span><span id="networkAddresses">—</span></div><div id="wifiSetup" hidden><p class="notice">The setup hotspot normally scans for visible saved Wi-Fi. Forced hotspot mode pauses automatic reconnection. Choose a network below to connect immediately.</p><div class="network-actions"><button id="scanWifi" class="secondary" type="button">Scan nearby Wi-Fi</button></div><div class="network-form"><label>Nearby networks<select id="wifiList"><option value="">Select or enter a network</option></select></label><label>Wi-Fi name<input id="wifiSsid" maxlength="32" autocomplete="off" placeholder="Network name"></label><label>Password<input id="wifiPassword" type="password" maxlength="63" autocomplete="new-password" placeholder="Leave blank for open Wi-Fi"></label></div><div class="network-actions"><button id="saveWifi" type="button">Save and connect</button></div><p id="networkMessage" class="notice"></p></div><div id="wifiForget" hidden><p class="notice">Remove the current Wi-Fi credentials and return to the setup hotspot. Visible saved networks can reconnect automatically while the scanner is idle.</p><div class="network-actions"><button id="forgetWifi" class="danger" type="button">Forget current Wi-Fi</button></div><p id="forgetMessage" class="notice"></p></div><p class="notice">Triple-press the physical button while idle to keep the setup hotspot available without removing saved Wi-Fi. Double-press to view wired LAN and Wi-Fi addresses.</p><div class="network-actions"><button id="forgetAllWifi" class="danger" type="button">Forget all networks</button></div><p class="notice">Removes all saved Wi-Fi networks and keeps the setup hotspot available. Ethernet settings and the hotspot password are preserved.</p><p id="forgetAllMessage" class="notice" role="status"></p></article>
     <article class="card qr"><h2>Printable QR codes</h2><div class="qr-grid"><figure class="qr-item"><img src="/qr/1-connect-flyscanner-hotspot.png" alt="QR code for connecting to the Flyscanner setup hotspot"><figcaption><strong>1. Connect to Flyscanner</strong><span class="muted">Joins the temporary setup hotspot</span><a class="button-link secondary" href="/qr/1-connect-flyscanner-hotspot.png" download>Download PNG</a></figcaption></figure><figure class="qr-item"><img src="/qr/2-open-hotspot-dashboard.png" alt="QR code for opening the dashboard through the setup hotspot"><figcaption><strong>2. Hotspot dashboard</strong><span class="muted">Opens 10.42.0.1 while setting up</span><a class="button-link secondary" href="/qr/2-open-hotspot-dashboard.png" download>Download PNG</a></figcaption></figure><figure class="qr-item"><img src="/qr/3-open-network-dashboard.png" alt="QR code for opening the dashboard on a normal local network"><figcaption><strong>3. Network dashboard</strong><span class="muted">Opens flyscanner.local after setup</span><a class="button-link secondary" href="/qr/3-open-network-dashboard.png" download>Download PNG</a></figcaption></figure></div></article>
     <article class="card history"><h2>Recent scans</h2><table><thead><tr><th>Recording</th><th>Time</th><th>Score</th><th>IR</th><th>FPS</th><th>Brightness</th><th>Locked controls</th></tr></thead><tbody id="history"><tr><td colspan="7" class="muted">No scans recorded.</td></tr></tbody></table></article>
   </section>
@@ -468,6 +468,11 @@ score = (35 × 0.2) + (15 × 0.5) = 14.5</div>
     try {
       const data = await networkRequest('/api/network/status');
       $('networkMode').textContent = text(data.phase).replaceAll('_',' ');
+      $('networkAddresses').textContent = `LAN: ${(data.lan_ipv4 || []).join(', ') || 'not connected'} · ${data.hotspot_active ? 'Setup Wi-Fi' : 'Wi-Fi'}: ${(data.wifi_ipv4 || []).join(', ') || 'not connected'}`;
+      $('forgetAllWifi').disabled = Boolean(data.scanner_busy) || ['switching','forgetting_wifi','forgetting_all_wifi'].includes(data.phase);
+      $('forgetWifi').disabled = $('forgetAllWifi').disabled;
+      if (data.forced_hotspot) $('networkMode').textContent = 'Setup hotspot held open';
+      if (data.forget_all_error) { $('forgetAllMessage').textContent = data.forget_all_error; $('forgetAllMessage').classList.add('error'); }
       currentWifiName = data.wifi_ssid || data.connection_name || '';
       $('networkConnection').textContent = data.hotspot_active ? `${data.hotspot_ssid} · 10.42.0.1` : (currentWifiName || data.detail || '—');
       $('wifiSetup').hidden = !data.hotspot_active;
@@ -475,6 +480,8 @@ score = (35 × 0.2) + (15 × 0.5) = 14.5</div>
     } catch (error) {
       $('networkMode').textContent = 'Setup helper unavailable';
       $('networkConnection').textContent = '—';
+      $('networkAddresses').textContent = '—';
+      $('forgetAllWifi').disabled = true;
       $('wifiSetup').hidden = true;
       $('wifiForget').hidden = true;
     }
@@ -508,6 +515,15 @@ score = (35 × 0.2) + (15 × 0.5) = 14.5</div>
       const data = await networkRequest('/api/network/forget', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({confirm:true})});
       $('forgetMessage').textContent = data.message; $('networkMode').textContent = 'Forgetting Wi-Fi';
     } catch (error) { $('forgetMessage').textContent = error.message; $('forgetMessage').classList.add('error'); button.disabled = false; }
+  });
+  $('forgetAllWifi').addEventListener('click', async () => {
+    if (!confirm('Forget all saved Wi-Fi networks?\n\nWi-Fi will disconnect and the setup hotspot will stay available at http://10.42.0.1:8080. Ethernet settings are preserved.')) return;
+    const button = $('forgetAllWifi'); button.disabled = true;
+    $('forgetAllMessage').textContent = 'Removing all saved Wi-Fi networks…'; $('forgetAllMessage').classList.remove('error');
+    try {
+      const data = await networkRequest('/api/network/forget-all', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({confirm:true})});
+      $('forgetAllMessage').textContent = data.message; $('networkMode').textContent = 'Forgetting all Wi-Fi';
+    } catch (error) { $('forgetAllMessage').textContent = error.message; $('forgetAllMessage').classList.add('error'); button.disabled = false; }
   });
   connect();
   refreshNetwork();
